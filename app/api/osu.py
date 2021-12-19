@@ -1746,8 +1746,13 @@ async def api_get_player_scores(conn: Connection) -> HTTPResponse:
 
     scope = conn.args["scope"]
 
-    if (mode_arg := conn.args.get("mode", None)) is not None:
-        if not (mode_arg.isdecimal() and 0 <= (mode := int(mode_arg)) <= 7):
+    if "mode" in conn.args:
+        if not conn.args["mode"].isdecimal():
+            return (400, JSON({"status": "Invalid mode."}))
+
+        mode = int(conn.args["mode"])
+
+        if not 0 <= mode <= 7:
             return (400, JSON({"status": "Invalid mode."}))
 
         mode = GameMode(mode)
@@ -1770,8 +1775,13 @@ async def api_get_player_scores(conn: Connection) -> HTTPResponse:
     else:
         mods = None
 
-    if (limit_arg := conn.args.get("limit", None)) is not None:
-        if not (limit_arg.isdecimal() and 0 < (limit := int(limit_arg)) <= 100):
+    if "limit" in conn.args:
+        if not conn.args["limit"].isdecimal():
+            return (400, JSON({"status": "Invalid limit."}))
+
+        limit = int(conn.args["limit"])
+
+        if not 0 < limit <= 100:
             return (400, JSON({"status": "Invalid limit."}))
     else:
         limit = 25
@@ -1798,13 +1808,12 @@ async def api_get_player_scores(conn: Connection) -> HTTPResponse:
         params["mods"] = mods
 
     if scope == "best":
-        include_loved = (
-            "include_loved" in conn.args and conn.args["include_loved"] == "1"
-        )
-
         allowed_statuses = [2, 3]
 
-        if include_loved:
+        if (
+            "include_loved" in conn.args
+            and conn.args["include_loved"].lower() == "true"
+        ):
             allowed_statuses.append(5)
 
         query.append("AND t.status = 2 AND b.status IN :statuses")
@@ -1812,6 +1821,9 @@ async def api_get_player_scores(conn: Connection) -> HTTPResponse:
         sort = "t.pp"
     else:
         sort = "t.play_time"
+
+    if "include_failed" in conn.args and conn.args["include_failed"].lower() == "false":
+        query.append("AND t.status != 0")
 
     query.append(f"ORDER BY {sort} DESC LIMIT :limit")
     params["limit"] = limit
@@ -1859,16 +1871,26 @@ async def api_get_player_most_played(conn: Connection) -> HTTPResponse:
 
     # parse args (mode, limit)
 
-    if (mode_arg := conn.args.get("mode", None)) is not None:
-        if not (mode_arg.isdecimal() and 0 <= (mode := int(mode_arg)) <= 7):
+    if "mode" in conn.args:
+        if not conn.args["mode"].isdecimal():
+            return (400, JSON({"status": "Invalid mode."}))
+
+        mode = int(conn.args["mode"])
+
+        if not 0 <= mode <= 7:
             return (400, JSON({"status": "Invalid mode."}))
 
         mode = GameMode(mode)
     else:
         mode = GameMode.VANILLA_OSU
 
-    if (limit_arg := conn.args.get("limit", None)) is not None:
-        if not (limit_arg.isdecimal() and 0 < (limit := int(limit_arg)) <= 100):
+    if "limit" in conn.args:
+        if not conn.args["limit"].isdecimal():
+            return (400, JSON({"status": "Invalid limit."}))
+
+        limit = int(conn.args["limit"])
+
+        if not 0 < limit <= 100:
             return (400, JSON({"status": "Invalid limit."}))
     else:
         limit = 25
@@ -1936,8 +1958,13 @@ async def api_get_map_scores(conn: Connection) -> HTTPResponse:
 
     scope = conn.args["scope"]
 
-    if (mode_arg := conn.args.get("mode", None)) is not None:
-        if not (mode_arg.isdecimal() and 0 <= (mode := int(mode_arg)) <= 7):
+    if "mode" in conn.args:
+        if not conn.args["mode"].isdecimal():
+            return (400, JSON({"status": "Invalid mode."}))
+
+        mode = int(conn.args["mode"])
+
+        if not 0 <= mode <= 7:
             return (400, JSON({"status": "Invalid mode."}))
 
         mode = GameMode(mode)
@@ -1960,8 +1987,13 @@ async def api_get_map_scores(conn: Connection) -> HTTPResponse:
     else:
         mods = None
 
-    if (limit_arg := conn.args.get("limit", None)) is not None:
-        if not (limit_arg.isdecimal() and 0 < (limit := int(limit_arg)) <= 100):
+    if "limit" in conn.args:
+        if not conn.args["limit"].isdecimal():
+            return (400, JSON({"status": "Invalid limit."}))
+
+        limit = int(conn.args["limit"])
+
+        if not 0 < limit <= 100:
             return (400, JSON({"status": "Invalid limit."}))
     else:
         limit = 50
@@ -2208,25 +2240,63 @@ async def api_get_match(conn: Connection) -> HTTPResponse:
 async def api_get_global_leaderboard(conn: Connection) -> HTTPResponse:
     conn.resp_headers["Content-Type"] = "application/json"
 
-    if (mode_arg := conn.args.get("mode", None)) is not None:
-        if not (mode_arg.isdecimal() and 0 <= (mode := int(mode_arg)) <= 7):
+    if "mode" in conn.args:
+        if not conn.args["mode"].isdecimal():
+            return (400, JSON({"status": "Invalid mode."}))
+
+        mode = int(conn.args["mode"])
+
+        if not 0 <= mode <= 7:
             return (400, JSON({"status": "Invalid mode."}))
 
         mode = GameMode(mode)
     else:
         mode = GameMode.VANILLA_OSU
 
-    if (limit_arg := conn.args.get("limit", None)) is not None:
-        if not (limit_arg.isdecimal() and 0 < (limit := int(limit_arg)) <= 100):
+    if "limit" in conn.args:
+        if not conn.args["limit"].isdecimal():
+            return (400, JSON({"status": "Invalid limit."}))
+
+        limit = int(conn.args["limit"])
+
+        if not 0 < limit <= 100:
             return (400, JSON({"status": "Invalid limit."}))
     else:
         limit = 25
+
+    if "offset" in conn.args:
+        if not conn.args["offset"].isdecimal():
+            return (400, JSON({"status": "Invalid offset."}))
+
+        offset = int(conn.args["offset"])
+
+        if not 0 < offset <= 0x7FFFFFFF:
+            return (400, JSON({"status": "Invalid offset."}))
+    else:
+        offset = 0
 
     if (sort := conn.args.get("sort", None)) is not None:
         if sort not in ("tscore", "rscore", "pp", "acc"):
             return (400, JSON({"status": "Invalid sort."}))
     else:
         sort = "pp"
+
+    if "country" in conn.args:
+        # "CA", "US", "ZW"
+        if len(conn.args["country"]) != 2:
+            # https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
+            return (400, JSON({"status": "Invalid country."}))
+
+        country = conn.args["country"]
+    else:
+        country = None
+
+    query_conditions = ["s.mode = :mode", "u.priv & 1", f"s.{sort} > 0"]
+    query_parameters: dict[str, object] = {"mode": mode}
+
+    if country is not None:
+        query_conditions.append("u.country = :country")
+        query_parameters["country"] = country
 
     rows = await app.state.services.database.fetch_all(
         "SELECT u.id as player_id, u.name, u.country, s.tscore, s.rscore, "
@@ -2236,9 +2306,9 @@ async def api_get_global_leaderboard(conn: Connection) -> HTTPResponse:
         "FROM stats s "
         "LEFT JOIN users u USING (id) "
         "LEFT JOIN clans c ON u.clan_id = c.id "
-        f"WHERE s.mode = :mode AND u.priv & 1 AND s.{sort} > 0 "
-        f"ORDER BY s.{sort} DESC LIMIT :limit",
-        {"mode": mode, "limit": limit},
+        f"WHERE {' AND '.join(query_conditions)} "
+        f"ORDER BY s.{sort} DESC LIMIT :offset, :limit",
+        query_parameters | {"offset": offset, "limit": limit},
     )
 
     return JSON({"status": "success", "leaderboard": [dict(row) for row in rows]})
