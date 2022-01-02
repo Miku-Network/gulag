@@ -1,12 +1,7 @@
-import asyncio
 import inspect
 import io
-import ipaddress
 import os
-import re
-import secrets
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -18,26 +13,21 @@ from typing import Callable
 from typing import Optional
 from typing import Sequence
 from typing import Type
-from typing import TypedDict
 from typing import TypeVar
 from typing import Union
 
-import cmyui
 import databases.core
-import dill as pickle
 import orjson
 import pymysql
 import requests
 from cmyui.logging import Ansi
 from cmyui.logging import log
 from cmyui.logging import printc
-from cmyui.logging import Rainbow
 from cmyui.osu.replay import Keys
 from cmyui.osu.replay import ReplayFrame
+from fastapi import status
 
 import app.settings
-import app.state
-from app.constants.countries import country_codes
 
 __all__ = (
     # TODO: organize/sort these
@@ -52,18 +42,9 @@ __all__ = (
     "running_via_asgi_webserver",
     "_install_synchronous_excepthook",
     "get_appropriate_stacktrace",
-    "log_strange_occurrence",
     "is_inet_address",
-    "Geolocation",
-    "fetch_geoloc_db",
-    "fetch_geoloc_web",
     "pymysql_encode",
     "escape_enum",
-    "shutdown_signal_handler",
-    "_handle_fut_exception",
-    "_conn_finished_cb",
-    "await_ongoing_connections",
-    "cancel_housekeeping_tasks",
     "ensure_supported_platform",
     "ensure_local_services_are_running",
     "ensure_directory_structure",
@@ -72,9 +53,8 @@ __all__ = (
     "_install_debugging_hooks",
     "display_startup_dialog",
     "create_config_from_default",
-    "_get_current_sql_structure_version",
-    "run_sql_migrations",
     "orjson_serialize_to_str",
+    "get_media_type",
 )
 
 DATA_PATH = Path.cwd() / ".data"
@@ -82,10 +62,7 @@ ACHIEVEMENTS_ASSETS_PATH = DATA_PATH / "assets/medals/client"
 DEFAULT_AVATAR_PATH = DATA_PATH / "avatars/default.jpg"
 DEBUG_HOOKS_PATH = Path.cwd() / "_testing/runtime.py"
 OPPAI_PATH = Path.cwd() / "oppai-ng"
-SQL_UPDATES_FILE = Path.cwd() / "migrations/migrations.sql"
 
-
-VERSION_RGX = re.compile(r"^# v(?P<ver>\d+\.\d+\.\d+)$")
 
 useful_keys = (Keys.M1, Keys.M2, Keys.K1, Keys.K2)
 
@@ -144,13 +121,13 @@ async def fetch_bot_name(db_conn: databases.core.Connection) -> str:
 def _download_achievement_images_mirror(achievements_path: Path) -> bool:
     """Download all used achievement images (using mirror's zip)."""
     log("Downloading achievement images from mirror.", Ansi.LCYAN)
-    r = requests.get("https://cmyui.xyz/achievement_images.zip")
+    resp = requests.get("https://cmyui.xyz/achievement_images.zip")
 
-    if r.status_code != 200:
+    if resp.status_code != status.HTTP_200_OK:
         log("Failed to fetch from mirror, trying osu! servers.", Ansi.LRED)
         return False
 
-    with io.BytesIO(r.content) as data:
+    with io.BytesIO(resp.content) as data:
         with zipfile.ZipFile(data) as myfile:
             myfile.extractall(achievements_path)
 
@@ -174,12 +151,12 @@ def _download_achievement_images_osu(achievements_path: Path) -> bool:
     log("Downloading achievement images from osu!.", Ansi.LCYAN)
 
     for ach in achs:
-        r = requests.get(f"https://assets.ppy.sh/medals/client/{ach}")
-        if r.status_code != 200:
+        resp = requests.get(f"https://assets.ppy.sh/medals/client/{ach}")
+        if resp.status_code != 200:
             return False
 
         log(f"Saving achievement: {ach}", Ansi.LCYAN)
-        (achievements_path / ach).write_bytes(r.content)
+        (achievements_path / ach).write_bytes(resp.content)
 
     return True
 
@@ -203,14 +180,14 @@ def download_achievement_images(achievements_path: Path) -> None:
 
 def download_default_avatar(default_avatar_path: Path) -> None:
     """Download an avatar to use as the server's default."""
-    r = requests.get("https://i.cmyui.xyz/U24XBZw-4wjVME-JaEz3.png")
+    resp = requests.get("https://i.cmyui.xyz/U24XBZw-4wjVME-JaEz3.png")
 
-    if r.status_code != 200:
+    if resp.status_code != 200:
         log("Failed to fetch default avatar.", Ansi.LRED)
         return
 
     log("Downloaded default avatar.", Ansi.LGREEN)
-    default_avatar_path.write_bytes(r.content)
+    default_avatar_path.write_bytes(resp.content)
 
 
 def seconds_readable(seconds: int) -> str:
@@ -349,52 +326,6 @@ def get_appropriate_stacktrace() -> list[dict[str, Union[str, int, dict[str, str
     ]
 
 
-STRANGE_LOG_DIR = Path.cwd() / ".data/logs"
-
-
-async def log_strange_occurrence(obj: object) -> None:
-    pickled_obj: bytes = pickle.dumps(obj)
-    uploaded = False
-
-    if app.settings.AUTOMATICALLY_REPORT_PROBLEMS:
-        # automatically reporting problems to cmyui's server
-        async with app.state.services.http.post(
-            url="https://log.cmyui.xyz/",
-            headers={
-                "Gulag-Version": repr(app.settings.VERSION),
-                "Gulag-Domain": app.settings.DOMAIN,
-            },
-            data=pickled_obj,
-        ) as resp:
-            if resp.status == 200 and (await resp.read()) == b"ok":
-                uploaded = True
-                log("Logged strange occurrence to cmyui's server.", Ansi.LBLUE)
-                log("Thank you for your participation! <3", Rainbow)
-            else:
-                log(
-                    f"Autoupload to cmyui's server failed (HTTP {resp.status})",
-                    Ansi.LRED,
-                )
-
-    if not uploaded:
-        # log to a file locally, and prompt the user
-        while True:
-            log_file = STRANGE_LOG_DIR / f"strange_{secrets.token_hex(4)}.db"
-            if not log_file.exists():
-                break
-
-        log_file.touch(exist_ok=False)
-        log_file.write_bytes(pickled_obj)
-
-        log("Logged strange occurrence to", Ansi.LYELLOW, end=" ")
-        printc("/".join(log_file.parts[-4:]), Ansi.LBLUE)
-
-        log(
-            "Greatly appreciated if you could forward this to cmyui#0425 :)",
-            Ansi.LYELLOW,
-        )
-
-
 def is_inet_address(addr: Union[tuple[str, int], str]) -> bool:
     """Check whether addr is of type tuple[str, int]."""
     return (
@@ -403,67 +334,6 @@ def is_inet_address(addr: Union[tuple[str, int], str]) -> bool:
         and isinstance(addr[0], str)
         and isinstance(addr[1], int)
     )
-
-
-IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
-
-
-class Country(TypedDict):
-    acronym: str
-    numeric: int
-
-
-class Geolocation(TypedDict):
-    latitude: float
-    longitude: float
-    country: Country
-
-
-def fetch_geoloc_db(ip: IPAddress) -> Optional[Geolocation]:
-    """Fetch geolocation data based on ip (using local db)."""
-    if not app.state.services.geoloc_db:
-        return
-
-    res = app.state.services.geoloc_db.city(ip)
-
-    if res.country.iso_code is not None:
-        acronym = res.country.iso_code.lower()
-    else:
-        acronym = "XX"
-
-    return {
-        "latitude": res.location.latitude or 0.0,
-        "longitude": res.location.longitude or 0.0,
-        "country": {"acronym": acronym, "numeric": country_codes[acronym]},
-    }
-
-
-async def fetch_geoloc_web(ip: IPAddress) -> Optional[Geolocation]:
-    """Fetch geolocation data based on ip (using ip-api)."""
-    url = f"http://ip-api.com/line/{ip}"
-
-    async with app.state.services.http.get(url) as resp:
-        if not resp or resp.status != 200:
-            log("Failed to get geoloc data: request failed.", Ansi.LRED)
-            return
-
-        status, *lines = (await resp.text()).split("\n")
-
-        if status != "success":
-            err_msg = lines[0]
-            if err_msg == "invalid query":
-                err_msg += f" ({url})"
-
-            log(f"Failed to get geoloc data: {err_msg}.", Ansi.LRED)
-            return
-
-    acronym = lines[1].lower()
-
-    return {
-        "latitude": float(lines[6]),
-        "longitude": float(lines[7]),
-        "country": {"acronym": acronym, "numeric": country_codes[acronym]},
-    }
 
 
 T = TypeVar("T")
@@ -486,89 +356,6 @@ def escape_enum(
     _: Optional[dict[object, object]] = None,
 ) -> str:  # used for ^
     return str(int(val))
-
-
-def shutdown_signal_handler(signum: Union[int, signal.Signals]) -> None:
-    """Handle a posix signal, flagging the server to shut down."""
-    print("\x1b[2K", end="\r")  # remove ^C from window
-
-    # TODO: handle SIGUSR1 for restarting
-
-    if app.state.shutting_down:
-        return
-
-    log(f"Received {signal.strsignal(signum)}", Ansi.LRED)
-
-    app.state.shutting_down = True
-
-
-def _handle_fut_exception(fut: asyncio.Future) -> None:
-    if not fut.cancelled():
-        if exception := fut.exception():
-            app.state.loop.call_exception_handler(
-                {
-                    "message": "unhandled exception during loop shutdown",
-                    "exception": exception,
-                    "task": fut,
-                },
-            )
-
-
-def _conn_finished_cb(task: asyncio.Task) -> None:
-    if not task.cancelled():
-        exc = task.exception()
-        if exc is not None and not isinstance(exc, (SystemExit, KeyboardInterrupt)):
-            loop = asyncio.get_running_loop()
-            loop.default_exception_handler({"exception": exc})
-
-    app.state.sessions.ongoing_connections.remove(task)
-    task.remove_done_callback(_conn_finished_cb)
-
-
-async def await_ongoing_connections(timeout: float) -> None:
-    log(
-        f"-> Allowing up to {timeout:.2f} seconds for "
-        f"{len(app.state.sessions.ongoing_connections)} ongoing connection(s) to finish.",
-        Ansi.LMAGENTA,
-    )
-
-    done, pending = await asyncio.wait(
-        app.state.sessions.ongoing_connections,
-        timeout=timeout,
-    )
-
-    for task in done:
-        _handle_fut_exception(task)
-
-    if pending:
-        log(
-            f"-> Awaital timeout - cancelling {len(pending)} pending connection(s).",
-            Ansi.LRED,
-        )
-
-        for task in pending:
-            task.cancel()
-
-        await asyncio.gather(*pending, return_exceptions=True)
-
-        for task in pending:
-            _handle_fut_exception(task)
-
-
-async def cancel_housekeeping_tasks() -> None:
-    log(
-        f"-> Cancelling {len(app.state.sessions.housekeeping_tasks)} housekeeping tasks.",
-        Ansi.LMAGENTA,
-    )
-
-    # cancel housekeeping tasks
-    for task in app.state.sessions.housekeeping_tasks:
-        task.cancel()
-
-    await asyncio.gather(*app.state.sessions.housekeeping_tasks, return_exceptions=True)
-
-    for task in app.state.sessions.housekeeping_tasks:
-        _handle_fut_exception(task)
 
 
 def ensure_supported_platform() -> int:
@@ -613,11 +400,11 @@ def ensure_local_services_are_running() -> int:
                 stdout=subprocess.DEVNULL,
             )
             if pgrep_exit_code != 0:
-                log("Please start your mysqld server.", Ansi.LRED)
+                log("Unable to connect to mysql server.", Ansi.LRED)
                 return 1
 
     if not os.path.exists("/var/run/redis/redis-server.pid"):
-        log("Please start your redis server.", Ansi.LRED)
+        log("Unable to connect to redis server.", Ansi.LRED)
         return 1
 
     return 0
@@ -727,98 +514,14 @@ def create_config_from_default() -> None:
     shutil.copy("ext/config.sample.py", "config.py")
 
 
-async def _get_current_sql_structure_version() -> Optional[cmyui.Version]:
-    """Get the last launched version of the server."""
-    res = await app.state.services.database.fetch_one(
-        "SELECT ver_major, ver_minor, ver_micro "
-        "FROM startups ORDER BY datetime DESC LIMIT 1",
-    )
-
-    if res:
-        return cmyui.Version(*map(int, res))
-
-
-async def run_sql_migrations() -> None:
-    """Update the sql structure, if it has changed."""
-    if not (current_ver := await _get_current_sql_structure_version()):
-        return  # already up to date (server has never run before)
-
-    latest_ver = cmyui.Version.from_str(app.settings.VERSION)
-
-    if latest_ver == current_ver:
-        return  # already up to date
-
-    # version changed; there may be sql changes.
-    content = SQL_UPDATES_FILE.read_text()
-
-    queries = []
-    q_lines = []
-
-    update_ver = None
-
-    for line in content.splitlines():
-        if not line:
-            continue
-
-        if line.startswith("#"):
-            # may be normal comment or new version
-            if r_match := VERSION_RGX.fullmatch(line):
-                update_ver = cmyui.Version.from_str(r_match["ver"])
-
-            continue
-        elif not update_ver:
-            continue
-
-        # we only need the updates between the
-        # previous and new version of the server.
-        if current_ver < update_ver <= latest_ver:
-            if line.endswith(";"):
-                if q_lines:
-                    q_lines.append(line)
-                    queries.append(" ".join(q_lines))
-                    q_lines = []
-                else:
-                    queries.append(line)
-            else:
-                q_lines.append(line)
-
-    if not queries:
-        return
-
-    log(
-        f"Updating mysql structure (v{current_ver!r} -> v{latest_ver!r}).",
-        Ansi.LMAGENTA,
-    )
-
-    # XXX: so it turns out we can't use a transaction here (at least with mysql)
-    #      to roll back changes, as any structural changes to tables implicitly
-    #      commit: https://dev.mysql.com/doc/refman/5.7/en/implicit-commit.html
-    async with app.state.services.database.connection() as db_conn:
-        for query in queries:
-            try:
-                await db_conn.execute(query)
-            except pymysql.err.MySQLError as exc:
-                log(f"Failed: {query}", Ansi.GRAY)  # type: ignore
-                log(repr(exc))
-                log(
-                    "SQL failed to update - unless you've been "
-                    "modifying sql and know what caused this, "
-                    "please please contact cmyui#0425.",
-                    Ansi.LRED,
-                )
-                raise KeyboardInterrupt from exc
-        else:
-            # all queries executed successfully
-            await db_conn.execute(
-                "INSERT INTO startups (ver_major, ver_minor, ver_micro, datetime) "
-                "VALUES (:major, :minor, :micro, NOW())",
-                {
-                    "major": latest_ver.major,
-                    "minor": latest_ver.minor,
-                    "micro": latest_ver.micro,
-                },
-            )
-
-
 def orjson_serialize_to_str(*args, **kwargs) -> str:
     return orjson.dumps(*args, **kwargs).decode()
+
+
+def get_media_type(extension: str) -> Optional[str]:
+    if extension in ("jpg", "jpeg"):
+        return "image/jpeg"
+    elif extension == "png":
+        return "image/png"
+
+    # return none, fastapi will attempt to figure it out

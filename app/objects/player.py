@@ -36,14 +36,13 @@ from app.objects.menu import MenuFunction
 from app.objects.score import Grade
 from app.objects.score import Score
 from app.utils import escape_enum
-from app.utils import Geolocation
 from app.utils import pymysql_encode
 
 if TYPE_CHECKING:
     from app.objects.achievement import Achievement
     from app.objects.beatmap import Beatmap
     from app.objects.clan import Clan
-    from app.objects.clan import ClanPrivileges
+    from app.constants.privileges import ClanPrivileges
 
 __all__ = ("ModeData", "Status", "Player")
 
@@ -90,6 +89,7 @@ class ModeData:
     plays: int
     playtime: int
     max_combo: int
+    total_hits: int
     rank: int  # global
 
     grades: dict[Grade, int]  # XH, X, SH, S, A
@@ -197,7 +197,6 @@ class Player:
         "achievements",
         "recent_scores",
         "last_np",
-        "country",
         "location",
         "utc_offset",
         "pm_private",
@@ -257,7 +256,7 @@ class Player:
 
         self.achievements: set["Achievement"] = set()
 
-        self.geoloc: Geolocation = extras.get(
+        self.geoloc: app.state.services.Geolocation = extras.get(
             "geoloc",
             {
                 "latitude": 0.0,
@@ -910,7 +909,7 @@ class Player:
     async def unlock_achievement(self, a: "Achievement") -> None:
         """Unlock `ach` for `self`, storing in both cache & sql."""
         await app.state.services.database.execute(
-            "INSERT INTO user_achievements (:user_id, :ach_id) VALUES (:user_id, :ach_id)",
+            "INSERT INTO user_achievements (userid, achid) VALUES (:user_id, :ach_id)",
             {"user_id": self.id, "ach_id": a.id},
         )
 
@@ -918,7 +917,7 @@ class Player:
 
     async def relationships_from_sql(self, db_conn: databases.core.Connection) -> None:
         """Retrieve `self`'s relationships from sql."""
-        async for row in db_conn.iterate(
+        for row in await db_conn.fetch_all(
             "SELECT user2, type FROM relationships WHERE user1 = :user1",
             {"user1": self.id},
         ):
@@ -932,7 +931,7 @@ class Player:
 
     async def achievements_from_sql(self, db_conn: databases.core.Connection) -> None:
         """Retrieve `self`'s achievements from sql."""
-        async for row in db_conn.iterate(
+        for row in await db_conn.fetch_all(
             "SELECT ua.achid id FROM user_achievements ua "
             "INNER JOIN achievements a ON a.id = ua.achid "
             "WHERE ua.userid = :user_id",
@@ -987,7 +986,7 @@ class Player:
         for mode, row in enumerate(
             await db_conn.fetch_all(
                 "SELECT tscore, rscore, pp, acc, "
-                "plays, playtime, max_combo, "
+                "plays, playtime, max_combo, total_hits, "
                 "xh_count, x_count, sh_count, s_count, a_count "
                 "FROM stats "
                 "WHERE id = :user_id",

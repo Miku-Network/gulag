@@ -42,12 +42,12 @@ from app.constants import regexes
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
 from app.constants.mods import SPEED_CHANGING_MODS
+from app.constants.privileges import ClanPrivileges
 from app.constants.privileges import Privileges
 from app.objects.beatmap import Beatmap
 from app.objects.beatmap import ensure_local_osu_file
 from app.objects.beatmap import RankedStatus
 from app.objects.clan import Clan
-from app.objects.clan import ClanPrivileges
 from app.objects.match import MapPool
 from app.objects.match import Match
 from app.objects.match import MatchTeams
@@ -698,7 +698,7 @@ async def _map(ctx: Context) -> Optional[str]:
                 )
             ]
 
-            for bmap in app.state.cache["beatmapset"][bmap.set_id].maps:
+            for bmap in app.state.cache.beatmapset[bmap.set_id].maps:
                 bmap.status = new_status
 
         else:
@@ -710,8 +710,8 @@ async def _map(ctx: Context) -> Optional[str]:
 
             map_ids = [bmap.id]
 
-            if bmap.md5 in app.state.cache["beatmap"]:
-                app.state.cache["beatmap"][bmap.md5].status = new_status
+            if bmap.md5 in app.state.cache.beatmap:
+                app.state.cache.beatmap[bmap.md5].status = new_status
 
         # deactivate rank requests for all ids
         await db_conn.execute(
@@ -1462,14 +1462,14 @@ async def server(ctx: Context) -> Optional[str]:
     )
 
 
-""" Advanced commands (only allowed with `advanced = True` in config) """
-
-# NOTE: some of these commands are potentially dangerous, and only
-# really intended for advanced users looking for access to lower level
-# utilities. Some may give direct access to utilties that could perform
-# harmful tasks to the underlying machine, so use at your own risk.
-
 if app.settings.DEVELOPER_MODE:
+    """Advanced (& potentially dangerous) commands"""
+
+    # NOTE: some of these commands are potentially dangerous, and only
+    # really intended for advanced users looking for access to lower level
+    # utilities. Some may give direct access to utilties that could perform
+    # harmful tasks to the underlying machine, so use at your own risk.
+
     from sys import modules as installed_mods
 
     __py_namespace = globals() | {
@@ -2571,7 +2571,7 @@ async def clan_info(ctx: Context) -> Optional[str]:
     msg = [f"{clan!r} | Founded {clan.created_at:%b %d, %Y}."]
 
     # get members privs from sql
-    async for row in app.state.services.database.iterate(
+    for row in await app.state.services.database.fetch_all(
         "SELECT name, clan_priv "
         "FROM users "
         "WHERE clan_id = :clan_id "
