@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from collections import defaultdict
 from datetime import datetime as datetime
@@ -12,15 +14,15 @@ from typing import TypedDict
 from typing import Union
 
 import databases.core
-from cmyui.logging import Ansi
-from cmyui.logging import log
 
+import app.packets
 import app.settings
 import app.state
-import packets
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
+from app.logging import Ansi
+from app.logging import log
 from app.objects.beatmap import Beatmap
 from app.utils import escape_enum
 from app.utils import pymysql_encode
@@ -103,7 +105,7 @@ class MapPool:
         id: int,
         name: str,
         created_at: datetime,
-        created_by: "Player",
+        created_by: Player,
     ) -> None:
         self.id = id
         self.name = name
@@ -151,7 +153,7 @@ class Slot:
     __slots__ = ("player", "status", "team", "mods", "loaded", "skipped")
 
     def __init__(self) -> None:
-        self.player: Optional["Player"] = None
+        self.player: Optional[Player] = None
         self.status = SlotStatus.open
         self.team = MatchTeams.neutral
         self.mods = Mods.NOMOD
@@ -161,7 +163,7 @@ class Slot:
     def empty(self) -> bool:
         return self.player is None
 
-    def copy_from(self, other: "Slot") -> None:
+    def copy_from(self, other: Slot) -> None:
         self.player = other.player
         self.status = other.status
         self.team = other.team
@@ -177,8 +179,8 @@ class Slot:
 
 
 class StartingTimers(TypedDict):
-    start: Optional["TimerHandle"]
-    alerts: Optional[list["TimerHandle"]]
+    start: Optional[TimerHandle]
+    alerts: Optional[list[TimerHandle]]
     time: Optional[float]
 
 
@@ -244,7 +246,7 @@ class Match:
         self.passwd = ""
 
         self.host_id = 0
-        self._refs: set["Player"] = set()
+        self._refs: set[Player] = set()
 
         self.map_id = 0
         self.map_md5 = ""
@@ -255,7 +257,7 @@ class Match:
         self.mode = GameMode.VANILLA_OSU
         self.freemods = False
 
-        self.chat: Optional["Channel"] = None  # multiplayer
+        self.chat: Optional[Channel] = None  # multiplayer
         self.slots = [Slot() for _ in range(16)]
 
         # self.type = MatchTypes.standard
@@ -270,16 +272,16 @@ class Match:
 
         # scrimmage stuff
         self.is_scrimming = False
-        self.match_points: dict[Union[MatchTeams, "Player"], int] = defaultdict(int)
+        self.match_points: dict[Union[MatchTeams, Player], int] = defaultdict(int)
         self.bans: set[tuple[Mods, int]] = set()
-        self.winners: list[Union["Player", MatchTeams, None]] = []  # none for tie
+        self.winners: list[Union[Player, MatchTeams, None]] = []  # none for tie
         self.winning_pts = 0
         self.use_pp_scoring = False  # only for scrims
 
         self.tourney_clients: set[int] = set()  # player ids
 
     @classmethod
-    def from_parsed_match(cls, parsed_match: packets.MultiplayerMatch) -> "Match":
+    def from_parsed_match(cls, parsed_match: app.packets.MultiplayerMatch) -> Match:
         obj = cls()
         obj.mods = Mods(parsed_match.mods)
 
@@ -313,7 +315,7 @@ class Match:
         return obj
 
     @property  # TODO: test cache speed
-    def host(self) -> "Player":
+    def host(self) -> Player:
         p = app.state.sessions.players.get(id=self.host_id)
         assert p is not None
         return p
@@ -339,7 +341,7 @@ class Match:
         return f"[{self.map_url} {self.map_name}]"
 
     @property
-    def refs(self) -> set["Player"]:
+    def refs(self) -> set[Player]:
         """Return all players with referee permissions."""
         refs = self._refs
 
@@ -348,7 +350,7 @@ class Match:
 
         return refs
 
-    def __contains__(self, p: "Player") -> bool:
+    def __contains__(self, p: Player) -> bool:
         return p in {s.player for s in self.slots}
 
     @overload
@@ -365,17 +367,21 @@ class Match:
     def __repr__(self) -> str:
         return f"<{self.name} ({self.id})>"
 
-    def get_slot(self, p: "Player") -> Optional[Slot]:
+    def get_slot(self, p: Player) -> Optional[Slot]:
         """Return the slot containing a given player."""
         for s in self.slots:
             if p is s.player:
                 return s
 
-    def get_slot_id(self, p: "Player") -> Optional[int]:
+        return None
+
+    def get_slot_id(self, p: Player) -> Optional[int]:
         """Return the slot index containing a given player."""
         for idx, s in enumerate(self.slots):
             if p is s.player:
                 return idx
+
+        return None
 
     def get_free(self) -> Optional[int]:
         """Return the first unoccupied slot in multi, if any."""
@@ -383,13 +389,17 @@ class Match:
             if s.status == SlotStatus.open:
                 return idx
 
+        return None
+
     def get_host_slot(self) -> Optional[Slot]:
         """Return the slot containing the host."""
         for s in self.slots:
             if s.status & SlotStatus.has_player and s.player is self.host:
                 return s
 
-    def copy(self, m: "Match") -> None:
+        return None
+
+    def copy(self, m: Match) -> None:
         """Fully copy the data of another match obj."""
         self.map_id = m.map_id
         self.map_md5 = m.map_md5
@@ -418,10 +428,10 @@ class Match:
         # TODO: hmm this is pretty bad, writes twice
 
         # send password only to users currently in the match.
-        self.chat.enqueue(packets.update_match(self, send_pw=True))
+        self.chat.enqueue(app.packets.update_match(self, send_pw=True))
 
         if lobby and (lchan := app.state.sessions.channels["#lobby"]) and lchan.players:
-            lchan.enqueue(packets.update_match(self, send_pw=False))
+            lchan.enqueue(app.packets.update_match(self, send_pw=False))
 
     def unready_players(self, expected: SlotStatus = SlotStatus.ready) -> None:
         """Unready any players in the `expected` state."""
@@ -442,7 +452,7 @@ class Match:
                     no_map.append(s.player.id)
 
         self.in_progress = True
-        self.enqueue(packets.match_start(self), immune=no_map, lobby=False)
+        self.enqueue(app.packets.match_start(self), immune=no_map, lobby=False)
         self.enqueue_state()
 
     def reset_scrim(self) -> None:
@@ -454,10 +464,10 @@ class Match:
     async def await_submissions(
         self,
         was_playing: Sequence[Slot],
-    ) -> "tuple[dict[Union[MatchTeams, Player], int], Sequence[Player]]":
+    ) -> tuple[dict[Union[MatchTeams, Player], int], Sequence[Player]]:
         """Await score submissions from all players in completed state."""
-        scores: "dict[Union[MatchTeams, Player], int]" = defaultdict(int)
-        didnt_submit: list["Player"] = []
+        scores: dict[Union[MatchTeams, Player], int] = defaultdict(int)
+        didnt_submit: list[Player] = []
         time_waited = 0  # allow up to 10s (total, not per player)
 
         ffa = self.team_type in (MatchTeamTypes.head_to_head, MatchTeamTypes.tag_coop)
@@ -485,7 +495,7 @@ class Match:
                 if (
                     rc_score
                     and rc_score.bmap.md5 == self.map_md5
-                    and rc_score.play_time > max_age
+                    and rc_score.server_time > max_age
                 ):
                     # score found, add to our scores dict if != 0.
                     if score := getattr(rc_score, win_cond):
@@ -543,10 +553,11 @@ class Match:
             # all scores are equal, it was a tie.
             if len(scores) != 1 and len(set(scores.values())) == 1:
                 self.winners.append(None)
-                return self.chat.send_bot("The point has ended in a tie!")
+                self.chat.send_bot("The point has ended in a tie!")
+                return None
 
             # Find the winner & increment their matchpoints.
-            winner: Union["Player", MatchTeams] = max(scores, key=lambda k: scores[k])
+            winner: Union[Player, MatchTeams] = max(scores, key=lambda k: scores[k])
             self.winners.append(winner)
             self.match_points[winner] += 1
 

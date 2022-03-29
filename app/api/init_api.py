@@ -1,24 +1,29 @@
 # #!/usr/bin/env python3.9
+from __future__ import annotations
+
 import asyncio
 import os
+import pprint
 
 import aiohttp
 import orjson
-from cmyui.logging import Ansi
-from cmyui.logging import log
 from fastapi import FastAPI
 from fastapi import status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
+from fastapi.responses import ORJSONResponse
 from fastapi.responses import Response
 from starlette.middleware.base import RequestResponseEndpoint
 
+import app.bg_loops
 import app.settings
 import app.state
 import app.utils
-import bg_loops
 from app.api import domains
 from app.api import middlewares
+from app.logging import Ansi
+from app.logging import log
 from app.objects import collections
 
 
@@ -28,16 +33,19 @@ def init_exception_handlers(asgi_app: FastAPI) -> None:
         request: Request,
         exc: RequestValidationError,
     ) -> Response:
-        print(f"Validation error on {request.url}", "\n", exc.errors())
+        """Wrapper around 422 validation errors to print out info for devs."""
+        log(f"Validation error on {request.url}", Ansi.LRED)
+        pprint.pprint(exc.errors())
 
-        return Response(
-            content=exc.errors(),
+        return ORJSONResponse(
+            content={"detail": jsonable_encoder(exc.errors())},
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
 
 def init_middlewares(asgi_app: FastAPI) -> None:
     """Initialize our app's middleware stack."""
+    asgi_app.add_middleware(middlewares.MetricsMiddleware)
 
     @asgi_app.middleware("http")
     async def http_middleware(
@@ -59,8 +67,6 @@ def init_middlewares(asgi_app: FastAPI) -> None:
 
             # unrelated issue, raise normally
             raise exc
-
-    asgi_app.add_middleware(middlewares.MetricsMiddleware)
 
 
 def init_events(asgi_app: FastAPI) -> None:
@@ -87,14 +93,19 @@ def init_events(asgi_app: FastAPI) -> None:
                 flush_in_thread=True,
                 flush_interval=15,
             )
-            app.state.services.datadog.gauge("gulag.online_players", 0)
+            app.state.services.datadog.gauge("bancho.online_players", 0)
+
+        app.state.services.ip_resolver = app.state.services.IPResolver()
 
         await app.state.services.run_sql_migrations()
 
         async with app.state.services.database.connection() as db_conn:
             await collections.initialize_ram_caches(db_conn)
 
-        await bg_loops.initialize_housekeeping_tasks()
+        await app.bg_loops.initialize_housekeeping_tasks()
+
+        log("Startup process complete.", Ansi.LGREEN)
+        log(f"Listening @ {app.settings.SERVER_ADDR}", Ansi.LMAGENTA)
 
     @asgi_app.on_event("shutdown")
     async def on_shutdown() -> None:
@@ -127,7 +138,7 @@ def init_routes(asgi_app: FastAPI) -> None:
         asgi_app.host(f"osu.{domain}", domains.osu.router)
         asgi_app.host(f"b.{domain}", domains.map.router)
 
-        # gulag's developer-facing api
+        # bancho.py's developer-facing api
         asgi_app.host(f"api.{domain}", domains.api.router)
 
 

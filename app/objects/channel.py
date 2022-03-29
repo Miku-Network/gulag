@@ -1,9 +1,10 @@
-import functools
+from __future__ import annotations
+
 from typing import Sequence
 from typing import TYPE_CHECKING
 
+import app.packets
 import app.state
-import packets
 from app.constants.privileges import Privileges
 
 if TYPE_CHECKING:
@@ -65,33 +66,31 @@ class Channel:
         self.auto_join = auto_join
         self.instance = instance
 
-        self.players: list["Player"] = []
+        self.players: list[Player] = []
 
     def __repr__(self) -> str:
         return f"<{self._name}>"
 
-    def __contains__(self, p: "Player") -> bool:
+    def __contains__(self, p: Player) -> bool:
         return p in self.players
 
     # XXX: should this be cached differently?
 
-    @functools.cache
     def can_read(self, priv: Privileges) -> bool:
         if not self.read_priv:
             return True
 
         return priv & self.read_priv != 0
 
-    @functools.cache
     def can_write(self, priv: Privileges) -> bool:
         if not self.write_priv:
             return True
 
         return priv & self.write_priv != 0
 
-    def send(self, msg: str, sender: "Player", to_self: bool = False) -> None:
+    def send(self, msg: str, sender: Player, to_self: bool = False) -> None:
         """Enqueue `msg` to all appropriate clients from `sender`."""
-        data = packets.send_message(
+        data = app.packets.send_message(
             sender=sender.name,
             msg=msg,
             recipient=self.name,
@@ -112,7 +111,7 @@ class Channel:
             msg = f"message would have crashed games ({msg_len} chars)"
 
         self.enqueue(
-            packets.send_message(
+            app.packets.send_message(
                 sender=bot.name,
                 msg=msg,
                 recipient=self.name,
@@ -123,19 +122,19 @@ class Channel:
     def send_selective(
         self,
         msg: str,
-        sender: "Player",
-        recipients: set["Player"],
+        sender: Player,
+        recipients: set[Player],
     ) -> None:
         """Enqueue `sender`'s `msg` to `recipients`."""
         for p in recipients:
             if p in self:
                 p.send(msg, sender=sender, chan=self)
 
-    def append(self, p: "Player") -> None:
+    def append(self, p: Player) -> None:
         """Add `p` to the channel's players."""
         self.players.append(p)
 
-    def remove(self, p: "Player") -> None:
+    def remove(self, p: Player) -> None:
         """Remove `p` from the channel's players."""
         self.players.remove(p)
 

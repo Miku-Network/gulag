@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import copy
 import importlib
@@ -9,16 +11,18 @@ import secrets
 import signal
 import struct
 import time
+import traceback
 import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
-from importlib.metadata import version as pkg_version
 from pathlib import Path
 from time import perf_counter_ns as clock_ns
+from typing import Any
 from typing import Awaitable
 from typing import Callable
+from typing import Mapping
 from typing import NamedTuple
 from typing import Optional
 from typing import Sequence
@@ -27,19 +31,18 @@ from typing import TypedDict
 from typing import TypeVar
 from typing import Union
 
-import cmyui.utils
 import psutil
 import timeago
-from cmyui.osu.oppai_ng import OppaiWrapper
-from peace_performance_python.objects import Beatmap as PeaceMap
-from peace_performance_python.objects import Calculator as PeaceCalculator
 
+import app.logging
+import app.packets
 import app.settings
 import app.state
+import app.usecases.performance
 import app.utils
-import packets
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
+from app.constants.gamemodes import GAMEMODE_REPR_LIST
 from app.constants.mods import Mods
 from app.constants.mods import SPEED_CHANGING_MODS
 from app.constants.privileges import ClanPrivileges
@@ -56,7 +59,13 @@ from app.objects.match import MatchWinConditions
 from app.objects.match import SlotStatus
 from app.objects.player import Player
 from app.objects.score import SubmissionStatus
+from app.usecases.performance import ScoreDifficultyParams
 from app.utils import seconds_readable
+
+try:
+    from oppai_ng.oppai import OppaiWrapper
+except ModuleNotFoundError:
+    pass  # utils will handle this for us
 
 if TYPE_CHECKING:
     from app.objects.channel import Channel
@@ -72,7 +81,7 @@ class Context:
     trigger: str
     args: Sequence[str]
 
-    recipient: Union["Channel", Player]
+    recipient: Union[Channel, Player]
 
 
 Callback = Callable[[Context], Awaitable[Optional[str]]]
@@ -243,7 +252,7 @@ async def reconnect(ctx: Context) -> Optional[str]:
     if ctx.args:
         # !reconnect <player>
         if not ctx.player.priv & Privileges.ADMINISTRATOR:
-            return  # requires admin
+            return None  # requires admin
 
         target = app.state.sessions.players.get(name=" ".join(ctx.args))
         if not target:
@@ -253,6 +262,8 @@ async def reconnect(ctx: Context) -> Optional[str]:
         target = ctx.player
 
     target.logout()
+
+    return None
 
 
 @command(Privileges.DONATOR)
@@ -284,9 +295,11 @@ async def changename(ctx: Context) -> Optional[str]:
     )
 
     ctx.player.enqueue(
-        packets.notification(f"Your username has been changed to {name}!"),
+        app.packets.notification(f"Your username has been changed to {name}!"),
     )
     ctx.player.logout()
+
+    return None
 
 
 @command(Privileges.NORMAL, aliases=["bloodcat", "beatconnect", "chimu", "q"])
@@ -310,7 +323,7 @@ async def maplink(ctx: Context) -> Optional[str]:
 
     # gatari.pw & nerina.pw are pretty much the only
     # reliable mirrors i know of? perhaps beatconnect
-    return f"[https://osu.gatari.pw/d/{bmap.set_id} {bmap.full}]"
+    return f"[https://osu.gatari.pw/d/{bmap.set_id} {bmap.full_name}]"
 
 
 @command(Privileges.NORMAL, aliases=["last", "r"])
@@ -336,7 +349,7 @@ async def recent(ctx: Context) -> Optional[str]:
         rank = s.rank if s.status == SubmissionStatus.BEST else "NA"
         l.append(f"PASS {{{s.pp:.2f}pp #{rank}}}")
     else:
-        # XXX: prior to v3.2.0, gulag didn't parse total_length from
+        # XXX: prior to v3.2.0, bancho.py didn't parse total_length from
         # the osu!api, and thus this can do some zerodivision moments.
         # this can probably be removed in the future, or better yet
         # replaced with a better system to fix the maps.
@@ -348,17 +361,6 @@ async def recent(ctx: Context) -> Optional[str]:
 
     return " | ".join(l)
 
-
-GAMEMODE_STRINGS = (
-    "osu!vn",
-    "taiko!vn",
-    "catch!vn",
-    "mania!vn",
-    "osu!rx",
-    "taiko!rx",
-    "catch!rx",
-    "osu!ap",
-)
 
 TOP_SCORE_FMTSTR = (
     "{idx}. ({pp:.2f}pp) [https://osu.{domain}/beatmaps/{bmapid} "
@@ -373,8 +375,16 @@ async def top(ctx: Context) -> Optional[str]:
     if (args_len := len(ctx.args)) not in (1, 2):
         return "Invalid syntax: !top <mode> (player)"
 
-    if ctx.args[0] not in GAMEMODE_STRINGS:
-        return f'Valid gamemodes: {", ".join(GAMEMODE_STRINGS)}.'
+    if ctx.args[0] not in GAMEMODE_REPR_LIST:
+        return f'Valid gamemodes: {", ".join(GAMEMODE_REPR_LIST)}.'
+
+    if ctx.args[0] in (
+        "rx!mania",
+        "ap!taiko",
+        "ap!catch",
+        "ap!mania",
+    ):
+        return "Impossible gamemode combination."
 
     if args_len == 2:
         if not regexes.USERNAME.match(ctx.args[1]):
@@ -389,14 +399,12 @@ async def top(ctx: Context) -> Optional[str]:
         # no player provided, use self
         p = ctx.player
 
-    mode_str, _, special_mode_str = ctx.args[0].partition("!")
-
-    mode = ["osu", "taiko", "catch", "mania"].index(mode_str)
-    table = f"scores_{special_mode_str}"
+    # !top rx!std
+    mode = GAMEMODE_REPR_LIST.index(ctx.args[0])
 
     scores = await app.state.services.database.fetch_all(
         "SELECT s.pp, b.artist, b.title, b.version, b.id AS bmapid "
-        f"FROM {table} s "
+        "FROM scores s "
         "LEFT JOIN maps b ON b.md5 = s.map_md5 "
         "WHERE s.userid = :user_id "
         "AND s.mode = :mode "
@@ -421,6 +429,87 @@ async def top(ctx: Context) -> Optional[str]:
 # TODO: !compare (compare to previous !last/!top post's map)
 
 
+class ParsingError(str):
+    ...
+
+
+def parse__with__command_args(
+    mode: int,
+    args: Sequence[str],
+) -> Union[Mapping[str, Any], ParsingError]:
+    """Parse arguments for the !with command."""
+
+    # tried to balance complexity vs correctness for this function
+    # TODO: it can surely be cleaned up further - need to rethink it?
+
+    if mode in (0, 1, 2):
+        if not args or len(args) > 4:
+            return ParsingError("Invalid syntax: !with <acc/nmiss/combo/mods ...>")
+
+        # !with 95% 1m 429x hddt
+        acc = mods = combo = nmiss = None
+
+        # parse acc, misses, combo and mods from arguments.
+        # tried to balance complexity vs correctness here
+        for arg in [str.lower(arg) for arg in args]:
+            # mandatory suffix, combo & nmiss
+            if combo is None and arg.endswith("x") and arg[:-1].isdecimal():
+                combo = int(arg[:-1])
+                # if combo > bmap.max_combo:
+                #    return "Invalid combo."
+            elif nmiss is None and arg.endswith("m") and arg[:-1].isdecimal():
+                nmiss = int(arg[:-1])
+                # TODO: store nobjects?
+                # if nmiss > bmap.max_combo:
+                #    return "Invalid misscount."
+            else:
+                # optional prefix/suffix, mods & accuracy
+                arg_stripped = arg.removeprefix("+").removesuffix("%")
+                if (
+                    mods is None
+                    and arg_stripped.isalpha()
+                    and len(arg_stripped) % 2 == 0
+                ):
+                    mods = Mods.from_modstr(arg_stripped)
+                    mods = mods.filter_invalid_combos(mode)
+                elif acc is None and arg_stripped.replace(".", "", 1).isdecimal():
+                    acc = float(arg_stripped)
+                    if not 0 <= acc <= 100:
+                        return ParsingError("Invalid accuracy.")
+                else:
+                    return ParsingError(f"Unknown argument: {arg}")
+
+        return {
+            "acc": acc,
+            "mods": mods,
+            "combo": combo,
+            "nmiss": nmiss,
+        }
+    else:  # mode == 4
+        if not args or len(args) > 2:
+            return ParsingError("Invalid syntax: !with <score/mods ...>")
+
+        score = 1000
+        mods = Mods.NOMOD
+
+        for param in (p.strip("+k") for p in args):
+            if param.isdecimal():  # acc
+                if not 0 <= (score := int(param)) <= 1000:
+                    return ParsingError("Invalid score.")
+                if score <= 500:
+                    return ParsingError("<=500k score is always 0pp.")
+            elif len(param) % 2 == 0:
+                mods = Mods.from_modstr(param)
+                mods = mods.filter_invalid_combos(mode)
+            else:
+                return ParsingError("Invalid syntax: !with <score/mods ...>")
+
+        return {
+            "mods": mods,
+            "score": score,
+        }
+
+
 @command(Privileges.NORMAL, aliases=["w"], hidden=True)
 async def _with(ctx: Context) -> Optional[str]:
     """Specify custom accuracy & mod combinations with `/np`."""
@@ -438,129 +527,47 @@ async def _with(ctx: Context) -> Optional[str]:
 
     mode_vn = ctx.player.last_np["mode_vn"]
 
-    if mode_vn in (0, 1, 2):  # osu, taiko, catch
-        if not ctx.args or len(ctx.args) > 4:
-            return "Invalid syntax: !with <acc/nmiss/combo/mods ...>"
+    command_args = parse__with__command_args(mode_vn, ctx.args)
+    if isinstance(command_args, ParsingError):
+        return str(command_args)
 
-        # !with 95% 1m 429x hddt
-        acc = mods = combo = nmiss = None
+    msg_fields = []
 
-        # parse acc, misses, combo and mods from arguments.
-        # tried to balance complexity vs correctness here
-        for arg in map(str.lower, ctx.args):
-            # mandatory suffix, combo & nmiss
-            if combo is None and arg.endswith("x") and arg[:-1].isdecimal():
-                combo = int(arg[:-1])
-                if combo > bmap.max_combo:
-                    return "Invalid combo."
-            elif nmiss is None and arg.endswith("m") and arg[:-1].isdecimal():
-                nmiss = int(arg[:-1])
-                # TODO: store nobjects?
-                if nmiss > bmap.max_combo:
-                    return "Invalid misscount."
-            else:
-                # optional prefix/suffix, mods & accuracy
-                arg_stripped = arg.removeprefix("+").removesuffix("%")
-                if (
-                    mods is None
-                    and arg_stripped.isalpha()
-                    and len(arg_stripped) % 2 == 0
-                ):
-                    mods = Mods.from_modstr(arg_stripped)
-                    mods = mods.filter_invalid_combos(mode_vn)
-                elif acc is None and arg_stripped.replace(".", "", 1).isdecimal():
-                    acc = float(arg_stripped)
-                    if not 0 <= acc <= 100:
-                        return "Invalid accuracy."
-                else:
-                    return f"Unknown argument: {arg}"
+    # include mods regardless of mode
+    if (mods := command_args.get("mods")) is not None:
+        msg_fields.append(f"{mods!r}")
 
-        msg = []
+    score_args: ScoreDifficultyParams = {}
 
-        if mode_vn == 0:
-            with OppaiWrapper("oppai-ng/liboppai.so") as ezpp:
-                if mods is not None:
-                    ezpp.set_mods(int(mods))
-                    msg.append(f"{mods!r}")
+    # include mode-specific fields
+    if mode_vn in (0, 1, 2):
+        if (nmiss := command_args["nmiss"]) is not None:
+            score_args["nmiss"] = nmiss
+            msg_fields.append(f"{nmiss}m")
 
-                if nmiss is not None:
-                    ezpp.set_nmiss(nmiss)
-                    msg.append(f"{nmiss}m")
+        if (combo := command_args["combo"]) is not None:
+            score_args["combo"] = combo
+            msg_fields.append(f"{combo}x")
 
-                if combo is not None:
-                    ezpp.set_combo(combo)
-                    msg.append(f"{combo}x")
+        if (acc := command_args["acc"]) is not None:
+            score_args["acc"] = acc
+            msg_fields.append(f"{acc:.2f}%")
 
-                if acc is not None:
-                    ezpp.set_accuracy_percent(acc)
-                    msg.append(f"{acc:.2f}%")
+    else:  # mode_vn == 3
+        if (score := command_args["score"]) is not None:
+            score_args["score"] = score * 1000
+            msg_fields.append(f"{score}k")
 
-                ezpp.calculate(osu_file_path)
-                pp, sr = ezpp.get_pp(), ezpp.get_sr()
+    result = app.usecases.performance.calculate_performances(
+        osu_file_path=str(osu_file_path),
+        mode=mode_vn,
+        mods=int(command_args["mods"]),
+        scores=[score_args],  # calculate one score
+    )
 
-                return f"{' '.join(msg)}: {pp:.2f}pp ({sr:.2f}*)"
-        else:
-            beatmap = PeaceMap(osu_file_path)
-            peace = PeaceCalculator()
-
-            if mods is not None:
-                peace.set_mods(int(mods))
-                msg.append(f"{mods!r}")
-
-            if nmiss is not None:
-                peace.set_miss(nmiss)
-                msg.append(f"{nmiss}m")
-
-            if combo is not None:
-                peace.set_combo(combo)
-                msg.append(f"{combo}x")
-
-            if acc is not None:
-                peace.set_acc(acc)
-                msg.append(f"{acc:.2f}%")
-
-            if mode_vn:
-                peace.set_mode(mode_vn)
-
-            calculated = peace.calculate(beatmap)
-
-            if math.isnan(calculated.pp) or math.isinf(calculated.pp):
-                # TODO: report to logserver
-                return f"{' '.join(msg)}: 0pp (0*)"
-
-            return f"{' '.join(msg)}: {calculated.pp:.2f}pp ({calculated.stars:.2f}*)"
-    else:  # mania
-        if not ctx.args or len(ctx.args) > 2:
-            return "Invalid syntax: !with <score/mods ...>"
-
-        score = 1000
-        mods = Mods.NOMOD
-
-        for param in (p.strip("+k") for p in ctx.args):
-            if param.isdecimal():  # acc
-                if not 0 <= (score := int(param)) <= 1000:
-                    return "Invalid score."
-                if score <= 500:
-                    return "<=500k score is always 0pp."
-            elif len(param) % 2 == 0:
-                mods = Mods.from_modstr(param)
-                mods = mods.filter_invalid_combos(mode_vn)
-            else:
-                return "Invalid syntax: !with <score/mods ...>"
-
-        beatmap = PeaceMap(osu_file_path)
-        peace = PeaceCalculator()
-
-        if mods != Mods.NOMOD:
-            peace.set_mods(int(mods))
-
-        if mode_vn:
-            peace.set_mode(mode_vn)
-
-        peace.set_score(score * 1000)
-
-        calc = peace.calculate(beatmap)
-        return f"{score}k {mods!r}: {calc.pp:.2f}pp ({calc.stars:.2f}*)"
+    return "{msg}: {performance:.2f}pp ({star_rating:.2f}*)".format(
+        msg=" ".join(msg_fields), **result[0]  # (first score result)
+    )
 
 
 @command(Privileges.NORMAL, aliases=["req"])
@@ -607,7 +614,7 @@ async def get_apikey(ctx: Context) -> Optional[str]:
     app.state.sessions.api_keys[ctx.player.api_key] = ctx.player.id
 
     ctx.player.enqueue(
-        packets.notification(
+        app.packets.notification(
             "Type /savelog and click the popup for an easy way to copy this.",
         ),
     )
@@ -727,6 +734,14 @@ async def _map(ctx: Context) -> Optional[str]:
 # and are generally for managing players.
 """
 
+ACTION_STRINGS = {
+    "restrict": "Restricted for",
+    "unrestrict": "Unrestricted for",
+    "silence": "Silenced for",
+    "unsilence": "Unsilenced for",
+    "note": "Note added:",
+}
+
 
 @command(Privileges.MODERATOR, hidden=True)
 async def notes(ctx: Context) -> Optional[str]:
@@ -745,7 +760,7 @@ async def notes(ctx: Context) -> Optional[str]:
         return "Invalid syntax: !notes <name> <days_back>"
 
     res = await app.state.services.database.fetch_all(
-        "SELECT `msg`, `time` "
+        "SELECT `action`, `msg`, `time`, `from` "
         "FROM `logs` WHERE `to` = :to "
         "AND UNIX_TIMESTAMP(`time`) >= UNIX_TIMESTAMP(NOW()) - :seconds "
         "ORDER BY `time` ASC",
@@ -755,7 +770,19 @@ async def notes(ctx: Context) -> Optional[str]:
     if not res:
         return f"No notes found on {t} in the past {days} days."
 
-    return "\n".join(["[{time}] {msg}".format(**row) for row in res])
+    notes = []
+    for row in res:
+        logger = await app.state.sessions.players.from_cache_or_sql(id=row["from"])
+        if not logger:
+            continue
+
+        action_str = ACTION_STRINGS.get(row["action"], "Unknown action:")
+        time_str = row["time"]
+        note = row["msg"]
+
+        notes.append(f"[{time_str}] {action_str} {note} by {logger.name}")
+
+    return "\n".join(notes)
 
 
 @command(Privileges.MODERATOR, hidden=True)
@@ -767,13 +794,16 @@ async def addnote(ctx: Context) -> Optional[str]:
     if not (t := await app.state.sessions.players.from_cache_or_sql(name=ctx.args[0])):
         return f'"{ctx.args[0]}" not found.'
 
-    log_msg = f'{ctx.player} added note: {" ".join(ctx.args[1:])}'
-
     await app.state.services.database.execute(
         "INSERT INTO logs "
-        "(`from`, `to`, `msg`, `time`) "
-        "VALUES (:from, :to, :msg, NOW())",
-        {"from": ctx.player.id, "to": t.id, "msg": log_msg},
+        "(`from`, `to`, `action`, `msg`, `time`) "
+        "VALUES (:from, :to, :action, :msg, NOW())",
+        {
+            "from": ctx.player.id,
+            "to": t.id,
+            "action": "note",
+            "msg": " ".join(ctx.args[1:]),
+        },
     )
 
     return f"Added note to {t}."
@@ -874,7 +904,7 @@ async def user(ctx: Context) -> Optional[str]:
             f"Channels: {[p._name for p in p.channels]}",
             f"Logged in: {timeago.format(p.login_time)}",
             f"Last server interaction: {timeago.format(p.last_recv_time)}",
-            f"osu! build: {p.osu_ver} | Tourney: {p.tourney_client}",
+            f"osu! build: {p.client_details.osu_version.date} | Tourney: {p.tourney_client}",
             f"Silenced: {p.silenced} | Spectating: {p.spectating}",
             f"Last /np: {last_np}",
             f"Recent score: {p.recent_score}",
@@ -944,7 +974,7 @@ async def alert(ctx: Context) -> Optional[str]:
 
     notif_txt = " ".join(ctx.args)
 
-    app.state.sessions.players.enqueue(packets.notification(notif_txt))
+    app.state.sessions.players.enqueue(app.packets.notification(notif_txt))
     return "Alert sent."
 
 
@@ -959,12 +989,12 @@ async def alertuser(ctx: Context) -> Optional[str]:
 
     notif_txt = " ".join(ctx.args[1:])
 
-    t.enqueue(packets.notification(notif_txt))
+    t.enqueue(app.packets.notification(notif_txt))
     return "Alert sent."
 
 
 # NOTE: this is pretty useless since it doesn't switch anything other
-# than the c[e4-6].ppy.sh domains; it exists on bancho as a tournament
+# than the c[e4].ppy.sh domains; it exists on bancho as a tournament
 # server switch mechanism, perhaps we could leverage this in the future.
 @command(Privileges.ADMINISTRATOR, hidden=True)
 async def switchserv(ctx: Context) -> Optional[str]:
@@ -974,7 +1004,7 @@ async def switchserv(ctx: Context) -> Optional[str]:
 
     new_bancho_ip = ctx.args[0]
 
-    ctx.player.enqueue(packets.switch_tournament_server(new_bancho_ip))
+    ctx.player.enqueue(app.packets.switch_tournament_server(new_bancho_ip))
     return "Have a nice journey.."
 
 
@@ -1004,7 +1034,7 @@ async def shutdown(ctx: Context) -> Optional[str]:
                 f'Reason: {" ".join(ctx.args[1:])}'
             )
 
-            app.state.sessions.players.enqueue(packets.notification(alert_msg))
+            app.state.sessions.players.enqueue(app.packets.notification(alert_msg))
 
         app.state.loop.call_later(delay, os.kill, os.getpid(), _signal)
         return f"Enqueued {ctx.trigger}."
@@ -1018,15 +1048,15 @@ async def shutdown(ctx: Context) -> Optional[str]:
 # simply not useful for any other roles.
 """
 
-_fake_users = []
+_fake_users: list[Player] = []
 
 
 @command(Privileges.DEVELOPER, aliases=["fu"])
 async def fakeusers(ctx: Context) -> Optional[str]:
     """Add fake users to the online player list (for testing)."""
-    # NOTE: this is mostly just for speedtesting things
-    # regarding presences/stats. it's implementation is
-    # indeed quite cursed, but rather efficient.
+    # NOTE: this function is *very* performance-oriented.
+    #       the implementation is pretty cursed.
+
     if (
         len(ctx.args) != 2
         or ctx.args[0] not in ("add", "rm")
@@ -1037,7 +1067,7 @@ async def fakeusers(ctx: Context) -> Optional[str]:
     action = ctx.args[0]
     amount = int(ctx.args[1])
     if not 0 < amount <= 100_000:
-        return "Amount must be in range 0-100k."
+        return "Amount must be in range 1-100k."
 
     # we start at half way through
     # the i32 space for fake user ids.
@@ -1048,61 +1078,70 @@ async def fakeusers(ctx: Context) -> Optional[str]:
     data = bytearray()
 
     if action == "add":
-        const_uinfo = {  # non important stuff
-            "utc_offset": 0,
-            "osu_ver": "dn",
-            "pm_private": False,
-            "clan": None,
-            "clan_priv": None,
-            "priv": Privileges.NORMAL | Privileges.VERIFIED,
-            "silence_end": 0,
-            "login_time": 0x7FFFFFFF,  # never auto-dc
-        }
+        ## create static data - no need to redo everything for each iteration
+        # NOTE: this is where most of the efficiency of this command comes from
 
-        _stats = packets.user_stats(ctx.player)
+        static_player = Player(
+            id=0,
+            name="",
+            utc_offset=0,
+            osu_ver="",
+            pm_private=False,
+            clan=None,
+            clan_priv=None,
+            priv=Privileges.NORMAL | Privileges.VERIFIED,
+            silence_end=0,
+            login_time=0x7FFFFFFF,  # never auto-dc
+        )
 
+        static_player.stats[GameMode.VANILLA_OSU] = copy.copy(
+            ctx.player.stats[GameMode.VANILLA_OSU],
+        )
+
+        static_presence = struct.pack(
+            "<BBBffi",
+            -5 + 24,  # timezone (-5 GMT: EST)
+            38,  # country (canada)
+            0b11111,  # all in-game privs
+            0.0,  # latitude
+            0.0,  # longitude
+            1,  # global rank
+        )
+
+        static_stats = app.packets.user_stats(ctx.player)
+
+        ## create new fake players
+        new_fakes = []
+
+        # get the current number of fake users
         if _fake_users:
-            current_fakes = max([x.id for x in _fake_users]) - (FAKE_ID_START - 1)
+            current_fakes = max(x.id for x in _fake_users) - (FAKE_ID_START - 1)
         else:
             current_fakes = 0
 
-        start_id = FAKE_ID_START + current_fakes
-        end_id = start_id + amount
-        vn_std = GameMode.VANILLA_OSU
+        start_user_id = FAKE_ID_START + current_fakes
+        end_user_id = start_user_id + amount
 
-        base_player = Player(id=0, name="", **const_uinfo)
-        base_player.stats[vn_std] = copy.copy(ctx.player.stats[vn_std])
-        new_fakes = []
+        # XXX: very hot (blocking) loop, can run up to 100k times.
+        #      performance improvements are very welcome!
+        for fake_user_id in range(start_user_id, end_user_id):
+            # create new fake player, using the static data as a base
+            fake = copy.copy(static_player)
+            fake.id = fake_user_id
+            fake.name = (name := f"fake #{fake_user_id - (FAKE_ID_START - 1)}")
 
-        # static part of the presence packet,
-        # no need to redo this every iteration.
-        static_presence = struct.pack(
-            "<BBBffi",
-            19,  # -5 (EST) + 24
-            38,  # country (canada)
-            0b11111,  # all in-game privs
-            0.0,
-            0.0,  # lat, lon
-            1,  # rank #1
-        )
-
-        for i in range(start_id, end_id):
-            # create new fake player from base
-            name = f"fake #{i - (FAKE_ID_START - 1)}"
-            fake = copy.copy(base_player)
-            fake.id = i
-            fake.name = name
+            name_len = len(name)
 
             # append userpresence packet
             data += struct.pack(
                 "<HxIi",
-                83,
-                21 + len(name),
-                i,  # packetid  # packet len  # userid
+                83,  # packetid
+                21 + name_len,  # packet len
+                fake_user_id,  # userid
             )
-            data += f"\x0b{chr(len(name))}{name}".encode()
+            data += f"\x0b{chr(name_len)}{name}".encode()  # username (hacky uleb)
             data += static_presence
-            data += _stats
+            data += static_stats
 
             new_fakes.append(fake)
 
@@ -1115,7 +1154,7 @@ async def fakeusers(ctx: Context) -> Optional[str]:
     else:  # remove
         len_fake_users = len(_fake_users)
         if amount > len_fake_users:
-            return f"Too many! only {len_fake_users} remaining."
+            return f"Too many! Only {len_fake_users} fake users remain."
 
         to_remove = _fake_users[len_fake_users - amount :]
         logout_packet_header = b"\x0c\x00\x00\x05\x00\x00\x00"
@@ -1177,23 +1216,22 @@ async def recalc(ctx: Context) -> Optional[str]:
             app.state.services.database.connection() as score_select_conn,
             app.state.services.database.connection() as update_conn,
         ):
-            with OppaiWrapper("oppai-ng/liboppai.so") as ezpp:
+            with OppaiWrapper() as ezpp:
                 ezpp.set_mode(0)  # TODO: other modes
-                for table in ("scores_vn", "scores_rx", "scores_ap"):
-                    for (
-                        row
-                    ) in await score_select_conn.fetch_all(  # TODO: should be aiter
+                for mode in (0, 4, 8):  # vn!std, rx!std, ap!std
+                    # TODO: this should be using an async generator
+                    for row in await score_select_conn.fetch_all(
                         "SELECT id, acc, mods, max_combo, nmiss "
-                        f"FROM {table} "
-                        "WHERE map_md5 = :map_md5 AND mode = 0",
-                        {"map_md5": bmap.md5},
+                        "FROM scores "
+                        "WHERE map_md5 = :map_md5 AND mode = :mode",
+                        {"map_md5": bmap.md5, "mode": mode},
                     ):
                         ezpp.set_mods(row["mods"])
                         ezpp.set_nmiss(row["nmiss"])  # clobbers acc
                         ezpp.set_combo(row["max_combo"])
                         ezpp.set_accuracy_percent(row["acc"])
 
-                        ezpp.calculate(osu_file_path)
+                        ezpp.calculate(str(osu_file_path))
 
                         pp = ezpp.get_pp()
 
@@ -1201,7 +1239,7 @@ async def recalc(ctx: Context) -> Optional[str]:
                             continue
 
                         await update_conn.execute(
-                            f"UPDATE {table} SET pp = :pp WHERE id = :score_id",
+                            "UPDATE scores SET pp = :pp WHERE id = :score_id",
                             {"pp": pp, "score_id": row["id"]},
                         )
 
@@ -1219,9 +1257,8 @@ async def recalc(ctx: Context) -> Optional[str]:
                 app.state.services.database.connection() as score_select_conn,
                 app.state.services.database.connection() as update_conn,
             ):
-                for (
-                    bmap_row
-                ) in await bmap_select_conn.fetch_all(  # TODO: should be aiter
+                # TODO: should be aiter
+                for bmap_row in await bmap_select_conn.fetch_all(
                     "SELECT id, md5 FROM maps WHERE passes > 0",
                 ):
                     bmap_id = bmap_row["id"]
@@ -1238,22 +1275,22 @@ async def recalc(ctx: Context) -> Optional[str]:
                         )
                         continue
 
-                    with OppaiWrapper("oppai-ng/liboppai.so") as ezpp:
+                    with OppaiWrapper() as ezpp:
                         ezpp.set_mode(0)  # TODO: other modes
-                        for table in ("scores_vn", "scores_rx", "scores_ap"):
-                            # TODO: this should probably also be an aiter
+                        for mode in (0, 4, 8):  # vn!std, rx!std, ap!std
+                            # TODO: this should be using an async generator
                             for row in await score_select_conn.fetch_all(
                                 "SELECT id, acc, mods, max_combo, nmiss "
-                                f"FROM {table} "
-                                "WHERE map_md5 = :map_md5 AND mode = 0",
-                                {"map_md5": bmap_md5},
+                                "FROM scores "
+                                "WHERE map_md5 = :map_md5 AND mode = :mode",
+                                {"map_md5": bmap_md5, "mode": mode},
                             ):
                                 ezpp.set_mods(row["mods"])
                                 ezpp.set_nmiss(row["nmiss"])  # clobbers acc
                                 ezpp.set_combo(row["max_combo"])
                                 ezpp.set_accuracy_percent(row["acc"])
 
-                                ezpp.calculate(osu_file_path)
+                                ezpp.calculate(str(osu_file_path))
 
                                 pp = ezpp.get_pp()
 
@@ -1261,7 +1298,7 @@ async def recalc(ctx: Context) -> Optional[str]:
                                     continue
 
                                 await update_conn.execute(
-                                    f"UPDATE {table} SET pp = :pp WHERE id = :score_id",
+                                    "UPDATE scores SET pp = :pp WHERE id = :score_id",
                                     {"pp": pp, "score_id": row["id"]},
                                 )
 
@@ -1297,7 +1334,7 @@ str_priv_dict = {
     "nominator": Privileges.NOMINATOR,
     "mod": Privileges.MODERATOR,
     "admin": Privileges.ADMINISTRATOR,
-    "dangerous": Privileges.DEVELOPER,
+    "developer": Privileges.DEVELOPER,
 }
 
 
@@ -1355,12 +1392,10 @@ async def wipemap(ctx: Context) -> Optional[str]:
     map_md5 = ctx.player.last_np["bmap"].md5
 
     # delete scores from all tables
-    async with app.state.services.database.connection() as db_conn:
-        for t in ("vn", "rx", "ap"):
-            await db_conn.execute(
-                f"DELETE FROM scores_{t} WHERE map_md5 = :map_md5",
-                {"map_md5": map_md5},
-            )
+    await app.state.services.database.execute(
+        "DELETE FROM scores WHERE map_md5 = :map_md5",
+        {"map_md5": map_md5},
+    )
 
     return "Scores wiped."
 
@@ -1369,6 +1404,8 @@ async def wipemap(ctx: Context) -> Optional[str]:
 async def menu(ctx: Context) -> Optional[str]:
     """Temporary command to illustrate the menu option idea."""
     ctx.player.send_current_menu()
+
+    return None
 
 
 @command(Privileges.DEVELOPER, aliases=["re"])
@@ -1402,7 +1439,7 @@ async def reload(ctx: Context) -> Optional[str]:
 async def server(ctx: Context) -> Optional[str]:
     """Retrieve performance data about the server."""
 
-    build_str = f"gulag v{app.settings.VERSION!r} ({app.settings.DOMAIN})"
+    build_str = f"bancho.py v{app.settings.VERSION} ({app.settings.DOMAIN})"
 
     # get info about this process
     proc = psutil.Process(os.getpid())
@@ -1420,31 +1457,36 @@ async def server(ctx: Context) -> Optional[str]:
         )
 
     # list of all cpus installed with thread count
-    cpus_info = " | ".join([f"{v}x {k}" for k, v in model_names.most_common()])
+    cpus_info = " | ".join(f"{v}x {k}" for k, v in model_names.most_common())
 
     # get system-wide ram usage
     sys_ram = psutil.virtual_memory()
 
-    # output ram usage as `{gulag_used}MB / {sys_used}MB / {sys_total}MB`
-    gulag_ram = proc.memory_info()[0]
-    ram_values = (gulag_ram, sys_ram.used, sys_ram.total)
+    # output ram usage as `{bancho_used}MB / {sys_used}MB / {sys_total}MB`
+    bancho_ram = proc.memory_info()[0]
+    ram_values = (bancho_ram, sys_ram.used, sys_ram.total)
     ram_info = " / ".join([f"{v // 1024 ** 2}MB" for v in ram_values])
 
+    # current state of settings
+    mirror_url = app.settings.MIRROR_URL
+    using_osuapi = app.settings.OSU_API_KEY != ""
+    advanced_mode = app.settings.DEVELOPER_MODE
+    auto_logging = app.settings.AUTOMATICALLY_REPORT_PROBLEMS
+
+    # package versioning info
     # divide up pkg versions, 3 displayed per line, e.g.
     # aiohttp v3.6.3 | aiomysql v0.0.21 | bcrypt v3.2.0
     # cmyui v1.7.3 | datadog v0.40.1 | geoip2 v4.1.0
     # maniera v1.0.0 | mysql-connector-python v8.0.23 | orjson v3.5.1
     # psutil v5.8.0 | py3rijndael v0.3.3 | uvloop v0.15.2
     reqs = (Path.cwd() / "requirements.txt").read_text().splitlines()
-    pkg_sections = [reqs[i : i + 3] for i in range(0, len(reqs), 3)]
-
-    mirror_url = app.settings.MIRROR_URL
-    using_osuapi = app.settings.OSU_API_KEY != ""
-    advanced_mode = app.settings.DEVELOPER_MODE
-    auto_logging = app.settings.AUTOMATICALLY_REPORT_PROBLEMS
+    requirements_info = "\n".join(
+        " | ".join("{} v{}".format(*pkg.split("==")) for pkg in section)
+        for section in (reqs[i : i + 3] for i in range(0, len(reqs), 3))
+    )
 
     return "\n".join(
-        [
+        (
             f"{build_str} | uptime: {seconds_readable(uptime)}",
             f"cpu(s): {cpus_info}",
             f"ram: {ram_info}",
@@ -1452,13 +1494,8 @@ async def server(ctx: Context) -> Optional[str]:
             f"advanced mode: {advanced_mode} | auto logging: {auto_logging}",
             "",
             "requirements",
-            "\n".join(
-                [
-                    " | ".join([f"{pkg} v{pkg_version(pkg)}" for pkg in section])
-                    for section in pkg_sections
-                ],
-            ),
-        ],
+            requirements_info,
+        ),
     )
 
 
@@ -1472,7 +1509,7 @@ if app.settings.DEVELOPER_MODE:
 
     from sys import modules as installed_mods
 
-    __py_namespace = globals() | {
+    __py_namespace: dict[str, Any] = globals() | {
         mod: __import__(mod)
         for mod in (
             "asyncio",
@@ -1481,7 +1518,6 @@ if app.settings.DEVELOPER_MODE:
             "sys",
             "struct",
             "discord",
-            "cmyui",
             "datetime",
             "time",
             "inspect",
@@ -1494,7 +1530,7 @@ if app.settings.DEVELOPER_MODE:
     @command(Privileges.DEVELOPER)
     async def py(ctx: Context) -> Optional[str]:
         """Allow for (async) access to the python interpreter."""
-        # This can be very good for getting used to gulag's API; just look
+        # This can be very good for getting used to bancho.py's API; just look
         # around the codebase and find things to play with in your server.
         # Ex: !py return (await app.state.sessions.players.get(name='cmyui')).status.action
         if not ctx.args:
@@ -1512,9 +1548,6 @@ if app.settings.DEVELOPER_MODE:
         if "__py" in __py_namespace:
             del __py_namespace["__py"]
 
-        if ret is None:
-            return "Success"
-
         # TODO: perhaps size checks?
 
         if not isinstance(ret, str):
@@ -1530,7 +1563,7 @@ if app.settings.DEVELOPER_MODE:
 
 
 def ensure_match(
-    f: Callable[[Context, "Match"], Awaitable[Optional[R]]],
+    f: Callable[[Context, Match], Awaitable[Optional[R]]],
 ) -> Callable[[Context], Awaitable[Optional[R]]]:
     @wraps(f)
     async def wrapper(ctx: Context) -> Optional[R]:
@@ -1540,17 +1573,17 @@ def ensure_match(
         # as we do some additional checks.
         if match is None:
             # player not in a match
-            return
+            return None
 
         if ctx.recipient is not match.chat:
             # message not in match channel
-            return
+            return None
 
         if f is not mp_help and (
             ctx.player not in match.refs and not ctx.player.priv & Privileges.TOURNAMENT
         ):
             # doesn't have privs to use !mp commands (allow help).
-            return
+            return None
 
         return await f(ctx, match)
 
@@ -1559,7 +1592,7 @@ def ensure_match(
 
 @mp_commands.add(Privileges.NORMAL, aliases=["h"])
 @ensure_match
-async def mp_help(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_help(ctx: Context, match: Match) -> Optional[str]:
     """Show all documented multiplayer commands the player can access."""
     prefix = app.settings.COMMAND_PREFIX
     cmds = []
@@ -1576,7 +1609,7 @@ async def mp_help(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["st"])
 @ensure_match
-async def mp_start(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_start(ctx: Context, match: Match) -> Optional[str]:
     """Start the current multiplayer match, with any players ready."""
     if len(ctx.args) > 1:
         return "Invalid syntax: !mp start <force/seconds>"
@@ -1662,7 +1695,7 @@ async def mp_start(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["a"])
 @ensure_match
-async def mp_abort(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_abort(ctx: Context, match: Match) -> Optional[str]:
     """Abort the current in-progress multiplayer match."""
     if not match.in_progress:
         return "Abort what?"
@@ -1670,14 +1703,14 @@ async def mp_abort(ctx: Context, match: "Match") -> Optional[str]:
     match.unready_players(expected=SlotStatus.playing)
 
     match.in_progress = False
-    match.enqueue(packets.match_abort())
+    match.enqueue(app.packets.match_abort())
     match.enqueue_state()
     return "Match aborted."
 
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_map(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_map(ctx: Context, match: Match) -> Optional[str]:
     """Set the current match's current map by id."""
     if len(ctx.args) != 1 or not ctx.args[0].isdecimal():
         return "Invalid syntax: !mp map <beatmapid>"
@@ -1692,7 +1725,7 @@ async def mp_map(ctx: Context, match: "Match") -> Optional[str]:
 
     match.map_id = bmap.id
     match.map_md5 = bmap.md5
-    match.map_name = bmap.full
+    match.map_name = bmap.full_name
 
     match.mode = bmap.mode
 
@@ -1702,7 +1735,7 @@ async def mp_map(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_mods(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_mods(ctx: Context, match: Match) -> Optional[str]:
     """Set the current match's mods, from string form."""
     if len(ctx.args) != 1 or len(ctx.args[0]) % 2 != 0:
         return "Invalid syntax: !mp mods <mods>"
@@ -1727,7 +1760,7 @@ async def mp_mods(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["fm", "fmods"])
 @ensure_match
-async def mp_freemods(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_freemods(ctx: Context, match: Match) -> Optional[str]:
     """Toggle freemods status for the match."""
     if len(ctx.args) != 1 or ctx.args[0] not in ("on", "off"):
         return "Invalid syntax: !mp freemods <on/off>"
@@ -1763,7 +1796,7 @@ async def mp_freemods(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_host(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_host(ctx: Context, match: Match) -> Optional[str]:
     """Set the current match's current host by id."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp host <name>"
@@ -1779,14 +1812,14 @@ async def mp_host(ctx: Context, match: "Match") -> Optional[str]:
 
     match.host_id = t.id
 
-    match.host.enqueue(packets.match_transfer_host())
+    match.host.enqueue(app.packets.match_transfer_host())
     match.enqueue_state(lobby=True)
     return "Match host updated."
 
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_randpw(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_randpw(ctx: Context, match: Match) -> Optional[str]:
     """Randomize the current match's password."""
     match.passwd = secrets.token_hex(8)
     return "Match password randomized."
@@ -1794,7 +1827,7 @@ async def mp_randpw(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["inv"])
 @ensure_match
-async def mp_invite(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_invite(ctx: Context, match: Match) -> Optional[str]:
     """Invite a player to the current match by name."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp invite <name>"
@@ -1808,13 +1841,13 @@ async def mp_invite(ctx: Context, match: "Match") -> Optional[str]:
     if t is ctx.player:
         return "You can't invite yourself!"
 
-    t.enqueue(packets.match_invite(ctx.player, t.name))
+    t.enqueue(app.packets.match_invite(ctx.player, t.name))
     return f"Invited {t} to the match."
 
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_addref(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_addref(ctx: Context, match: Match) -> Optional[str]:
     """Add a referee to the current match by name."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp addref <name>"
@@ -1834,7 +1867,7 @@ async def mp_addref(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_rmref(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_rmref(ctx: Context, match: Match) -> Optional[str]:
     """Remove a referee from the current match by name."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp addref <name>"
@@ -1854,14 +1887,14 @@ async def mp_rmref(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_listref(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_listref(ctx: Context, match: Match) -> Optional[str]:
     """List all referees from the current match."""
     return ", ".join(map(str, match.refs)) + "."
 
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_lock(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_lock(ctx: Context, match: Match) -> Optional[str]:
     """Lock all unused slots in the current match."""
     for slot in match.slots:
         if slot.status == SlotStatus.open:
@@ -1873,7 +1906,7 @@ async def mp_lock(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_unlock(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_unlock(ctx: Context, match: Match) -> Optional[str]:
     """Unlock locked slots in the current match."""
     for slot in match.slots:
         if slot.status == SlotStatus.locked:
@@ -1885,7 +1918,7 @@ async def mp_unlock(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_teams(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_teams(ctx: Context, match: Match) -> Optional[str]:
     """Change the team type for the current match."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp teams <type>"
@@ -1926,7 +1959,7 @@ async def mp_teams(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["cond"])
 @ensure_match
-async def mp_condition(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_condition(ctx: Context, match: Match) -> Optional[str]:
     """Change the win condition for the match."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp condition <type>"
@@ -1935,7 +1968,7 @@ async def mp_condition(ctx: Context, match: "Match") -> Optional[str]:
 
     if cond == "pp":
         # special case - pp can't actually be used as an ingame
-        # win condition, but gulag allows it to be passed into
+        # win condition, but bancho.py allows it to be passed into
         # this command during a scrims to use pp as a win cond.
         if not match.is_scrimming:
             return "PP is only useful as a win condition during scrims."
@@ -1964,7 +1997,7 @@ async def mp_condition(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["autoref"])
 @ensure_match
-async def mp_scrim(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_scrim(ctx: Context, match: Match) -> Optional[str]:
     """Start a scrim in the current match."""
     if len(ctx.args) != 1 or not (r_match := regexes.BEST_OF.fullmatch(ctx.args[0])):
         return "Invalid syntax: !mp scrim <bo#>"
@@ -2002,7 +2035,7 @@ async def mp_scrim(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["end"])
 @ensure_match
-async def mp_endscrim(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_endscrim(ctx: Context, match: Match) -> Optional[str]:
     """End the current matches ongoing scrim."""
     if not match.is_scrimming:
         return "Not currently scrimming!"
@@ -2014,7 +2047,7 @@ async def mp_endscrim(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["rm"])
 @ensure_match
-async def mp_rematch(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_rematch(ctx: Context, match: Match) -> Optional[str]:
     """Restart a scrim, or roll back previous match point."""
     if ctx.args:
         return "Invalid syntax: !mp rematch"
@@ -2050,7 +2083,7 @@ async def mp_rematch(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.ADMINISTRATOR, aliases=["f"], hidden=True)
 @ensure_match
-async def mp_force(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_force(ctx: Context, match: Match) -> Optional[str]:
     """Force a player into the current match by name."""
     # NOTE: this overrides any limits such as silences or passwd.
     if len(ctx.args) != 1:
@@ -2068,7 +2101,7 @@ async def mp_force(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["lp"])
 @ensure_match
-async def mp_loadpool(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_loadpool(ctx: Context, match: Match) -> Optional[str]:
     """Load a mappool into the current match."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp loadpool <name>"
@@ -2090,7 +2123,7 @@ async def mp_loadpool(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL, aliases=["ulp"])
 @ensure_match
-async def mp_unloadpool(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_unloadpool(ctx: Context, match: Match) -> Optional[str]:
     """Unload the current matches mappool."""
     if ctx.args:
         return "Invalid syntax: !mp unloadpool"
@@ -2107,7 +2140,7 @@ async def mp_unloadpool(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_ban(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_ban(ctx: Context, match: Match) -> Optional[str]:
     """Ban a pick in the currently loaded mappool."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp ban <pick>"
@@ -2137,7 +2170,7 @@ async def mp_ban(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_unban(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_unban(ctx: Context, match: Match) -> Optional[str]:
     """Unban a pick in the currently loaded mappool."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp unban <pick>"
@@ -2167,7 +2200,7 @@ async def mp_unban(ctx: Context, match: "Match") -> Optional[str]:
 
 @mp_commands.add(Privileges.NORMAL)
 @ensure_match
-async def mp_pick(ctx: Context, match: "Match") -> Optional[str]:
+async def mp_pick(ctx: Context, match: Match) -> Optional[str]:
     """Pick a map from the currently loaded mappool."""
     if len(ctx.args) != 1:
         return "Invalid syntax: !mp pick <pick>"
@@ -2195,7 +2228,7 @@ async def mp_pick(ctx: Context, match: "Match") -> Optional[str]:
     bmap = match.pool.maps[(mods, slot)]
     match.map_md5 = bmap.md5
     match.map_id = bmap.id
-    match.map_name = bmap.full
+    match.map_name = bmap.full_name
 
     # TODO: some kind of abstraction allowing
     # for something like !mp pick fm.
@@ -2424,7 +2457,7 @@ async def pool_info(ctx: Context) -> Optional[str]:
 
 
 """ Clan managment commands
-# The commands below are for managing gulag
+# The commands below are for managing bancho.py
 # clans, for users, clan staff, and server staff.
 """
 
@@ -2584,6 +2617,20 @@ async def clan_info(ctx: Context) -> Optional[str]:
     return "\n".join(msg)
 
 
+@clan_commands.add(Privileges.NORMAL)
+async def clan_leave(ctx: Context):
+    """Leaves the clan you're in."""
+    p = await app.state.sessions.players.from_cache_or_sql(name=ctx.player.name)
+
+    if not p.clan:
+        return "You're not in a clan."
+    elif p.clan_priv == ClanPrivileges.Owner:
+        return "You must transfer your clan's ownership before leaving it. Alternatively, you can use !clan disband."
+
+    await p.clan.remove_member(p)
+    return f"You have successfully left {p.clan!r}."
+
+
 # TODO: !clan inv, !clan join, !clan leave
 
 
@@ -2601,7 +2648,7 @@ async def clan_list(ctx: Context) -> Optional[str]:
     if offset >= (total_clans := len(app.state.sessions.clans)):
         return "No clans found."
 
-    msg = [f"gulag clans listing ({total_clans} total)."]
+    msg = [f"bancho.py clans listing ({total_clans} total)."]
 
     for idx, clan in enumerate(app.state.sessions.clans, offset):
         msg.append(f"{idx + 1}. {clan!r}")
@@ -2649,19 +2696,28 @@ async def process_commands(
     for cmd in commands:
         if trigger in cmd.triggers and p.priv & cmd.priv == cmd.priv:
             # found matching trigger with sufficient privs
-            res = await cmd.callback(
-                Context(
-                    player=p,
-                    trigger=trigger,
-                    args=args,
-                    recipient=target,
-                ),
-            )
+            try:
+                res = await cmd.callback(
+                    Context(
+                        player=p,
+                        trigger=trigger,
+                        args=args,
+                        recipient=target,
+                    ),
+                )
+            except Exception:
+                # print exception info to the console,
+                # but do not break the player's session.
+                traceback.print_exc()
 
-            if res:
+                res = "An exception occurred when running the command."
+
+            if res is not None:
                 # we have a message to return, include elapsed time
-                elapsed = cmyui.utils.magnitude_fmt_time(clock_ns() - start_time)
+                elapsed = app.logging.magnitude_fmt_time(clock_ns() - start_time)
                 return {"resp": f"{res} | Elapsed: {elapsed}", "hidden": cmd.hidden}
             else:
                 # no message to return
                 return {"resp": None, "hidden": False}
+
+    return None

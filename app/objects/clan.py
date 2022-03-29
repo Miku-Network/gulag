@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -13,7 +15,7 @@ __all__ = ("Clan",)
 
 
 class Clan:
-    """A class to represent a single gulag clan."""
+    """A class to represent a single bancho.py clan."""
 
     __slots__ = ("id", "name", "tag", "created_at", "owner_id", "member_ids")
 
@@ -26,7 +28,7 @@ class Clan:
         owner_id: int,
         member_ids: set[int] = set(),
     ) -> None:
-        """A class representing one of gulag's clans."""
+        """A class representing one of bancho.py's clans."""
         self.id = id
         self.name = name
         self.tag = tag
@@ -35,7 +37,7 @@ class Clan:
         self.owner_id = owner_id  # userid
         self.member_ids = member_ids  # userids
 
-    async def add_member(self, p: "Player") -> None:
+    async def add_member(self, p: Player) -> None:
         """Add a given player to the clan's members."""
         self.member_ids.add(p.id)
 
@@ -47,7 +49,7 @@ class Clan:
         p.clan = self
         p.clan_priv = ClanPrivileges.Member
 
-    async def remove_member(self, p: "Player") -> None:
+    async def remove_member(self, p: Player) -> None:
         """Remove a given player from the clan's members."""
         self.member_ids.remove(p.id)
 

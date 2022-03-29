@@ -378,3 +378,11 @@ alter table users add play_style int default 0 not null after preferred_mode;
 alter table users add custom_badge_name varchar(16) charset utf8 null after play_style;
 alter table users add custom_badge_icon varchar(64) null after custom_badge_name;
 alter table users add userpage_content varchar(2048) charset utf8 null after custom_badge_icon;
+
+# v4.2.0
+# please refer to tools/migrate_v420 for further v4.2.0 migrations
+update stats set mode = 8 where mode = 7;
+
+# v4.3.1
+alter table maps change server server enum('osu!', 'private') default 'osu!' not null;
+alter table mapsets change server server enum('osu!', 'private') default 'osu!' not null;

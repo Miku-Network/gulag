@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import inspect
 import io
+import ipaddress
 import os
 import shutil
 import socket
@@ -11,27 +14,22 @@ from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Optional
-from typing import Sequence
-from typing import Type
+from typing import TypedDict
 from typing import TypeVar
-from typing import Union
 
 import databases.core
 import orjson
 import pymysql
 import requests
-from cmyui.logging import Ansi
-from cmyui.logging import log
-from cmyui.logging import printc
-from cmyui.osu.replay import Keys
-from cmyui.osu.replay import ReplayFrame
 from fastapi import status
 
 import app.settings
+from app.logging import Ansi
+from app.logging import log
+from app.logging import printc
 
 __all__ = (
     # TODO: organize/sort these
-    "get_press_times",
     "make_safe_name",
     "fetch_bot_name",
     "download_achievement_images",
@@ -42,7 +40,8 @@ __all__ = (
     "running_via_asgi_webserver",
     "_install_synchronous_excepthook",
     "get_appropriate_stacktrace",
-    "is_inet_address",
+    "is_valid_inet_address",
+    "is_valid_unix_address",
     "pymysql_encode",
     "escape_enum",
     "ensure_supported_platform",
@@ -55,47 +54,16 @@ __all__ = (
     "create_config_from_default",
     "orjson_serialize_to_str",
     "get_media_type",
+    "has_jpeg_headers_and_trailers",
+    "has_png_headers_and_trailers",
 )
 
 DATA_PATH = Path.cwd() / ".data"
 ACHIEVEMENTS_ASSETS_PATH = DATA_PATH / "assets/medals/client"
 DEFAULT_AVATAR_PATH = DATA_PATH / "avatars/default.jpg"
 DEBUG_HOOKS_PATH = Path.cwd() / "_testing/runtime.py"
-OPPAI_PATH = Path.cwd() / "oppai-ng"
-
-
-useful_keys = (Keys.M1, Keys.M2, Keys.K1, Keys.K2)
-
-
-def get_press_times(frames: Sequence[ReplayFrame]) -> dict[int, list[int]]:
-    """A very basic function to press times of an osu! replay.
-    This is mostly only useful for taiko maps, since it
-    doesn't take holds into account (taiko has none).
-
-    In the future, we will make a version that can take
-    account for the type of note that is being hit, for
-    much more accurate and useful detection ability.
-    """
-    # TODO: remove negatives?
-    press_times: dict[int, list[int]] = {key: [] for key in useful_keys}
-    cumulative = {key: 0 for key in useful_keys}
-
-    prev_frame = frames[0]
-
-    for frame in frames[1:]:
-        for key in useful_keys:
-            if frame.keys & key:
-                # key pressed, add to cumulative
-                cumulative[key] += frame.delta
-            elif prev_frame.keys & key:
-                # key unpressed, add to press times
-                press_times[key].append(cumulative[key])
-                cumulative[key] = 0
-
-        prev_frame = frame
-
-    # return all keys with presses
-    return {k: v for k, v in press_times.items() if v}
+OPPAI_PATH = Path.cwd() / "oppai_ng"
+OLD_OPPAI_PATH = Path.cwd() / "oppai-ng"
 
 
 def make_safe_name(name: str) -> str:
@@ -223,7 +191,7 @@ def check_connection(timeout: float = 1.0) -> bool:
             try:
                 sock.connect((addr, 53))
                 return True
-            except socket.error:
+            except OSError:
                 continue
 
     # all connections failed
@@ -238,7 +206,7 @@ def processes_listening_on_unix_socket(socket_path: str) -> int:
     process_count = 0
 
     for line in unix_socket_data[1:]:
-        # 0000000045fe59d0: 00000002 00000000 00010000 0005 01 17665 /tmp/gulag.sock
+        # 0000000045fe59d0: 00000002 00000000 00010000 0005 01 17665 /tmp/bancho.sock
         tokens = line.split()
 
         # unused params
@@ -264,13 +232,13 @@ def running_via_asgi_webserver() -> bool:
 
 
 def _install_synchronous_excepthook() -> None:
-    """Install a thin wrapper for sys.excepthook to catch gulag-related stuff."""
+    """Install a thin wrapper for sys.excepthook to catch bancho-related stuff."""
     real_excepthook = sys.excepthook  # backup
 
     def _excepthook(
-        type_: Type[BaseException],
+        type_: type[BaseException],
         value: BaseException,
-        traceback: types.TracebackType,
+        traceback: Optional[types.TracebackType],
     ):
         if type_ is KeyboardInterrupt:
             print("\33[2K\r", end="Aborted startup.")
@@ -280,7 +248,7 @@ def _install_synchronous_excepthook() -> None:
         ):
             attr_name = value.args[0][34:-1]
             log(
-                "gulag's config has been updated, and has "
+                "bancho.py's config has been updated, and has "
                 f"added a new `{attr_name}` attribute.",
                 Ansi.LMAGENTA,
             )
@@ -292,7 +260,7 @@ def _install_synchronous_excepthook() -> None:
             return
 
         printc(
-            f"gulag v{app.settings.VERSION} ran into an issue before starting up :(",
+            f"bancho.py v{app.settings.VERSION} ran into an issue before starting up :(",
             Ansi.RED,
         )
         real_excepthook(type_, value, traceback)  # type: ignore
@@ -300,7 +268,15 @@ def _install_synchronous_excepthook() -> None:
     sys.excepthook = _excepthook
 
 
-def get_appropriate_stacktrace() -> list[dict[str, Union[str, int, dict[str, str]]]]:
+class FrameInfo(TypedDict):
+    function: str
+    filename: str
+    lineno: int
+    charno: int
+    locals: dict[str, str]
+
+
+def get_appropriate_stacktrace() -> list[FrameInfo]:
     """Return information of all frames related to cmyui_pkg and below."""
     stack = inspect.stack()[1:]
     for idx, frame in enumerate(stack):
@@ -317,23 +293,26 @@ def get_appropriate_stacktrace() -> list[dict[str, Union[str, int, dict[str, str
             "charno": frame.index or 0,
             "locals": {k: repr(v) for k, v in frame.frame.f_locals.items()},
         }
-        for frame in stack[:idx]
-    ][
         # reverse for python-like stacktrace
         # ordering; puts the most recent
         # call closest to the command line
-        ::-1
+        for frame in reversed(stack[:idx])
     ]
 
 
-def is_inet_address(addr: Union[tuple[str, int], str]) -> bool:
-    """Check whether addr is of type tuple[str, int]."""
-    return (
-        isinstance(addr, tuple)
-        and len(addr) == 2
-        and isinstance(addr[0], str)
-        and isinstance(addr[1], int)
-    )
+def is_valid_inet_address(address: str) -> bool:
+    """Check whether address is a valid ipv(4/6) address."""
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    else:
+        return True
+
+
+def is_valid_unix_address(address: str) -> bool:
+    """Check whether address is a valid unix address."""
+    return address.endswith(".sock")  # TODO: improve
 
 
 T = TypeVar("T")
@@ -359,20 +338,20 @@ def escape_enum(
 
 
 def ensure_supported_platform() -> int:
-    """Ensure we're running on an appropriate platform for gulag."""
+    """Ensure we're running on an appropriate platform for bancho.py."""
     if sys.platform != "linux":
-        log("gulag currently only supports linux", Ansi.LRED)
+        log("bancho.py currently only supports linux", Ansi.LRED)
         if sys.platform == "win32":
             log(
                 "you could also try wsl(2), i'd recommend ubuntu 18.04 "
-                "(i use it to test gulag)",
+                "(i use it to test bancho.py)",
                 Ansi.LBLUE,
             )
         return 1
 
     if sys.version_info < (3, 9):
         log(
-            "gulag uses many modern python features, "
+            "bancho.py uses many modern python features, "
             "and the minimum python version is 3.9.",
             Ansi.LRED,
         )
@@ -430,38 +409,55 @@ def ensure_directory_structure() -> int:
 
 
 def ensure_dependencies_and_requirements() -> int:
-    """Make sure all of gulag's dependencies are ready."""
-    if not OPPAI_PATH.exists():
+    """Make sure all of bancho.py's dependencies are ready."""
+    if (
+        not OPPAI_PATH.exists()
+        or not (OPPAI_PATH / "pybind11").exists()
+        or not any((OPPAI_PATH / "pybind11").iterdir())
+    ):
         log("No oppai-ng submodule found, attempting to clone.", Ansi.LMAGENTA)
         p = subprocess.Popen(
-            args=["git", "submodule", "init"],
+            args=["git", "submodule", "update", "--init", "--recursive"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if exit_code := p.wait():
-            log("Failed to initialize git submodules.", Ansi.LRED)
+            log("Failed to get git submodules.", Ansi.LRED)
             return exit_code
 
-        p = subprocess.Popen(
-            args=["git", "submodule", "update"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if exit_code := p.wait():
-            log("Failed to update git submodules.", Ansi.LRED)
-            return exit_code
-
-    if not (OPPAI_PATH / "liboppai.so").exists():
+    if not (OPPAI_PATH / "oppai.so").exists():
         log("No oppai-ng library found, attempting to build.", Ansi.LMAGENTA)
         p = subprocess.Popen(
-            args=["./libbuild"],
-            cwd="oppai-ng",
+            args=["./build"],
+            cwd="oppai_ng",
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         if exit_code := p.wait():
+            _, stderr = p.communicate()
+            print(stderr.decode())
             log("Failed to build oppai-ng automatically.", Ansi.LRED)
             return exit_code
+
+        log(
+            "oppai-ng built, please start bancho.py again!",
+            Ansi.LMAGENTA,
+        )  # restart is required to fix imports
+
+        if OLD_OPPAI_PATH.exists():
+            # they have the old oppai-ng folder on disk
+            # they may have made changes to their pp system,
+            # let them know that they can delete it & fork if needed
+            log(
+                "Note that with the v4.2.1 migration, the oppai-ng folder was "
+                "moved to oppai_ng (note the underscore). Your old oppai-ng "
+                "folder still exists, and if you have made diverging changes "
+                "to your PP system, you'll need to update the new oppai_ng "
+                "submodule to apply those changes.",
+                Ansi.LMAGENTA,
+            )
+
+        return 1
 
     return 0
 
@@ -492,12 +488,14 @@ def display_startup_dialog() -> None:
     """Print any general information or warnings to the console."""
     if app.settings.DEVELOPER_MODE:
         log("running in advanced mode", Ansi.LRED)
+    if app.settings.DEBUG:
+        log("running in debug mode", Ansi.LMAGENTA)
 
     # running on root grants the software potentally dangerous and
     # unnecessary power over the operating system and is not advised.
     if os.geteuid() == 0:
         log(
-            "It is not recommended to run gulag as root, especially in production..",
+            "It is not recommended to run bancho.py as root, especially in production..",
             Ansi.LYELLOW,
         )
 
@@ -525,3 +523,15 @@ def get_media_type(extension: str) -> Optional[str]:
         return "image/png"
 
     # return none, fastapi will attempt to figure it out
+    return None
+
+
+def has_jpeg_headers_and_trailers(data_view: memoryview) -> bool:
+    return data_view[:4] == b"\xff\xd8\xff\xe0" and data_view[6:11] == b"JFIF\x00"
+
+
+def has_png_headers_and_trailers(data_view: memoryview) -> bool:
+    return (
+        data_view[:8] == b"\x89PNG\r\n\x1a\n"
+        and data_view[-8] == b"\x49END\xae\x42\x60\x82"
+    )

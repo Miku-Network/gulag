@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 from typing import TYPE_CHECKING
 
-from cmyui.logging import Ansi
-from cmyui.logging import log
-
+from app.logging import Ansi
+from app.logging import log
 from app.objects.collections import Channels
 from app.objects.collections import Clans
 from app.objects.collections import MapPools
@@ -19,13 +20,13 @@ channels = Channels()
 pools = MapPools()
 clans = Clans()
 matches = Matches()
-achievements: list["Achievement"] = []
+achievements: list[Achievement] = []
 
-api_keys = {}
+api_keys: dict[str, int] = {}
 
 housekeeping_tasks: set[asyncio.Task] = set()
 
-bot: "Player"
+bot: Player
 
 
 # usecases

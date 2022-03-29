@@ -1,5 +1,7 @@
 # TODO: there is still a lot of inconsistency
 # in a lot of these classes; needs refactor.
+from __future__ import annotations
+
 import asyncio
 from typing import Any
 from typing import Iterable
@@ -10,14 +12,14 @@ from typing import Sequence
 from typing import Union
 
 import databases.core
-from cmyui.logging import Ansi
-from cmyui.logging import log
 
 import app.settings
 import app.state
 import app.utils
 from app.constants.privileges import ClanPrivileges
 from app.constants.privileges import Privileges
+from app.logging import Ansi
+from app.logging import log
 from app.objects.achievement import Achievement
 from app.objects.channel import Channel
 from app.objects.clan import Clan
@@ -49,7 +51,7 @@ class Channels(list[Channel]):
         """Check whether internal list contains `o`."""
         # Allow string to be passed to compare vs. name.
         if isinstance(o, str):
-            return o in map(lambda c: c.name, self)
+            return o in (chan.name for chan in self)
         else:
             return super().__contains__(o)
 
@@ -87,6 +89,8 @@ class Channels(list[Channel]):
         for c in self:
             if c._name == name:
                 return c
+
+        return None
 
     def append(self, c: Channel) -> None:
         """Append `c` to the list."""
@@ -134,13 +138,15 @@ class Matches(list[Optional[Match]]):
         return super().__iter__()
 
     def __repr__(self) -> str:
-        return f'[{", ".join([m.name for m in self if m])}]'
+        return f'[{", ".join(match.name for match in self if match)}]'
 
     def get_free(self) -> Optional[int]:
         """Return the first free match id from `self`."""
         for idx, m in enumerate(self):
             if m is None:
                 return idx
+
+        return None
 
     def append(self, m: Match) -> bool:
         """Append `m` to the list."""
@@ -186,7 +192,7 @@ class Players(list[Player]):
         # allow us to either pass in the player
         # obj, or the player name as a string.
         if isinstance(p, str):
-            return p in [player.name for player in self]
+            return p in (player.name for player in self)
         else:
             return super().__contains__(p)
 
@@ -240,6 +246,8 @@ class Players(list[Player]):
             if getattr(p, attr) == val:
                 return p
 
+        return None
+
     async def get_sql(self, **kwargs: object) -> Optional[Player]:
         """Get a player by token, id, or name from sql."""
         attr, val = self._parse_attr(kwargs)
@@ -253,7 +261,7 @@ class Players(list[Player]):
         )
 
         if not row:
-            return
+            return None
 
         row = dict(row)
 
@@ -266,7 +274,7 @@ class Players(list[Player]):
         else:
             row["clan"] = row["clan_priv"] = None
 
-        # country from acronym to {acronym, numeric}=
+        # country from acronym to {acronym, numeric}
         row["geoloc"] = {
             "latitude": 0.0,  # TODO
             "longitude": 0.0,
@@ -285,6 +293,8 @@ class Players(list[Player]):
         elif p := await self.get_sql(**kwargs):
             return p
 
+        return None
+
     async def from_login(
         self,
         name: str,
@@ -294,14 +304,16 @@ class Players(list[Player]):
         """Return a player with a given name & pw_md5, from cache or sql."""
         if not (p := self.get(name=name)):
             if not sql:  # not to fetch from sql.
-                return
+                return None
 
             if not (p := await self.get_sql(name=name)):
                 # no player found in sql either.
-                return
+                return None
 
         if app.state.cache.bcrypt[p.pw_bcrypt] == pw_md5.encode():
             return p
+
+        return None
 
     def append(self, p: Player) -> None:
         """Append `p` to the list."""
@@ -367,11 +379,13 @@ class MapPools(list[MapPool]):
             if getattr(p, attr) == val:
                 return p
 
+        return None
+
     def __contains__(self, o: Union[MapPool, str]) -> bool:
         """Check whether internal list contains `o`."""
         # Allow string to be passed to compare vs. name.
         if isinstance(o, str):
-            return o in [p.name for p in self]
+            return o in (pool.name for pool in self)
         else:
             return o in self
 
@@ -380,6 +394,8 @@ class MapPools(list[MapPool]):
         for p in self:
             if p.name == name:
                 return p
+
+        return None
 
     def append(self, m: MapPool) -> None:
         """Append `m` to the list."""
@@ -451,7 +467,7 @@ class Clans(list[Clan]):
         """Check whether internal list contains `o`."""
         # Allow string to be passed to compare vs. name.
         if isinstance(o, str):
-            return o in [c.name for c in self]
+            return o in (clan.name for clan in self)
         else:
             return o in self
 
@@ -466,6 +482,8 @@ class Clans(list[Clan]):
         for c in self:
             if getattr(c, attr) == val:
                 return c
+
+        return None
 
     def append(self, c: Clan) -> None:
         """Append `c` to the list."""

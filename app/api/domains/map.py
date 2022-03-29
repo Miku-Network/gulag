@@ -1,11 +1,13 @@
 """ bmap: static beatmap info (thumbnails, previews, etc.) """
+from __future__ import annotations
+
 from fastapi import APIRouter
 from fastapi import status
 from fastapi.requests import Request
 from fastapi.responses import RedirectResponse
 
 
-router = APIRouter(prefix="/map", tags=["Beatmaps"])
+router = APIRouter(tags=["Beatmaps"])
 
 # for now, just send everything to osu!
 # eventually if we do bmap submission, we'll need this.

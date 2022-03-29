@@ -1,5 +1,7 @@
 # note that this is still a very rough draft of
 # the concept and is subject to major refactoring
+from __future__ import annotations
+
 import random
 from enum import IntEnum
 from enum import unique
@@ -25,12 +27,12 @@ class MenuCommands(IntEnum):
 
 class Menu(NamedTuple):
     name: str
-    options: "dict[int, tuple[MenuCommands, Optional[Union[Menu, MenuFunction]]]]"
+    options: dict[int, tuple[MenuCommands, Optional[Union[Menu, MenuFunction]]]]
 
 
 class MenuFunction(NamedTuple):
     name: str
-    callback: Callable[["Player"], Awaitable[None]]
+    callback: Callable[[Player], Awaitable[None]]
 
 
 def menu_keygen() -> int:

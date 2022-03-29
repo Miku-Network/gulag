@@ -2,6 +2,7 @@
 # usage: enable http://localhost:8080 proxy in windows,
 #        (https://i.cmyui.xyz/DNnqifKHyBSA9X8NEHg.png)
 #        and run this with `mitmdump -qs tools/proxy.py`
+from __future__ import annotations
 
 domain = "cmyui.xyz"  # XXX: put your domain here
 
@@ -11,7 +12,7 @@ import sys
 from enum import unique
 from enum import IntEnum
 
-from cmyui.logging import RGB
+from app.logging import RGB
 from mitmproxy import http
 
 
@@ -97,9 +98,8 @@ def fmt_bytes(n: int | float) -> str:
     return f"{n:,.2f}{suffix}"
 
 
-_domain_escaped = domain.replace(".", r"\.")
 DOMAIN_RGX = re.compile(
-    r"^(?P<subdomain>osu|c[e4-6]?|a|s|b|assets)\." rf"(?:ppy\.sh|{_domain_escaped})$",
+    rf"^(?P<subdomain>osu|c[e4]?|a|s|b|assets)\.(?:ppy\.sh|{re.escape(domain)})$",
 )
 
 PACKET_HEADER_FMT = struct.Struct("<HxI")  # header gives us packet id & data length

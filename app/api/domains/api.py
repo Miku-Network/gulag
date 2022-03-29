@@ -1,4 +1,6 @@
-""" api: gulag's developer api for interacting with server state """
+""" api: bancho.py's developer api for interacting with server state """
+from __future__ import annotations
+
 import hashlib
 import struct
 from pathlib import Path as SystemPath
@@ -13,8 +15,8 @@ from fastapi.param_functions import Query
 from fastapi.responses import ORJSONResponse
 from fastapi.responses import StreamingResponse
 
+import app.packets
 import app.state
-import packets
 from app.constants import regexes
 from app.constants.gamemodes import GameMode
 from app.constants.mods import Mods
@@ -29,7 +31,7 @@ REPLAYS_PATH = SystemPath.cwd() / ".data/osr"
 SCREENSHOTS_PATH = SystemPath.cwd() / ".data/ss"
 
 
-router = APIRouter(tags=["gulag API"])
+router = APIRouter(tags=["bancho.py API"])
 
 # NOTE: the api is still under design and is subject to change.
 # to keep up with breaking changes, please either join our discord,
@@ -60,10 +62,9 @@ router = APIRouter(tags=["gulag API"])
 # POST/PUT /set_player_info: update user information (updates whatever received).
 
 DATETIME_OFFSET = 0x89F7FF5F7B58000
-SCOREID_BORDERS = tuple((((1 << 63) - 1) // 3) * i for i in range(1, 4))
 
 
-def format_clan_basic(clan: "Clan") -> dict[str, object]:
+def format_clan_basic(clan: Clan) -> dict[str, object]:
     return {
         "id": clan.id,
         "name": clan.name,
@@ -72,7 +73,7 @@ def format_clan_basic(clan: "Clan") -> dict[str, object]:
     }
 
 
-def format_player_basic(p: "Player") -> dict[str, object]:
+def format_player_basic(p: Player) -> dict[str, object]:
     return {
         "id": p.id,
         "name": p.name,
@@ -146,14 +147,14 @@ async def api_get_player_info(
     if username:
         user_info = await app.state.services.database.fetch_one(
             "SELECT id, name, safe_name, "
-            "priv, country, silence_end "
+            "priv, clan_id, country, silence_end "
             "FROM users WHERE safe_name = :username",
             {"username": username.lower()},
         )
     else:  # if user_id
         user_info = await app.state.services.database.fetch_one(
             "SELECT id, name, safe_name, "
-            "priv, country, silence_end "
+            "priv, clan_id, country, silence_end "
             "FROM users WHERE id = :userid",
             {"userid": user_id},
         )
@@ -175,9 +176,11 @@ async def api_get_player_info(
 
     # fetch user's stats if requested
     if scope in ("stats", "all"):
-        # get all regular stats
+        api_data["stats"] = {}
+
+        # get all stats
         rows = await app.state.services.database.fetch_all(
-            "SELECT tscore, rscore, pp, plays, playtime, acc, max_combo, "
+            "SELECT mode, tscore, rscore, pp, plays, playtime, acc, max_combo, "
             "xh_count, x_count, sh_count, s_count, a_count FROM stats "
             "WHERE id = :userid",
             {"userid": resolved_user_id},
@@ -185,20 +188,21 @@ async def api_get_player_info(
 
         for idx, mode_stats in enumerate([dict(row) for row in rows]):
             rank = await app.state.services.redis.zrevrank(
-                f"gulag:leaderboard:{idx}",
-                resolved_user_id,
+                f"bancho:leaderboard:{idx}",
+                str(resolved_user_id),
             )
             mode_stats["rank"] = rank + 1 if rank is not None else 0
 
             country_rank = await app.state.services.redis.zrevrank(
-                f"gulag:leaderboard:{idx}:{resolved_country}",
-                resolved_user_id,
+                f"bancho:leaderboard:{idx}:{resolved_country}",
+                str(resolved_user_id),
             )
             mode_stats["country_rank"] = (
                 country_rank + 1 if country_rank is not None else 0
             )
 
-        api_data["stats"] = [dict(row) for row in rows]
+            mode = str(mode_stats.pop("mode"))
+            api_data["stats"][mode] = mode_stats
 
     return ORJSONResponse({"status": "success", "player": api_data})
 
@@ -284,11 +288,23 @@ async def api_get_player_scores(
     user_id: Optional[int] = Query(None, alias="id", ge=3, le=2_147_483_647),
     username: Optional[str] = Query(None, alias="name", regex=regexes.USERNAME.pattern),
     mods_arg: Optional[str] = Query(None, alias="mods"),
-    mode_arg: int = Query(0, alias="mode", ge=0, le=7),
+    mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(25, ge=1, le=100),
     include_loved: bool = False,
+    include_failed: bool = True,
 ):
     """Return a list of a given user's recent/best scores."""
+    if mode_arg in (
+        GameMode.RELAX_MANIA,
+        GameMode.AUTOPILOT_CATCH,
+        GameMode.AUTOPILOT_TAIKO,
+        GameMode.AUTOPILOT_MANIA,
+    ):
+        return ORJSONResponse(
+            {"status": "Invalid gamemode."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
     if username and user_id:
         return ORJSONResponse(
             {"status": "Must provide either id OR name!"},
@@ -337,14 +353,14 @@ async def api_get_player_scores(
         "SELECT t.id, t.map_md5, t.score, t.pp, t.acc, t.max_combo, "
         "t.mods, t.n300, t.n100, t.n50, t.nmiss, t.ngeki, t.nkatu, t.grade, "
         "t.status, t.mode, t.play_time, t.time_elapsed, t.perfect "
-        f"FROM {mode.scores_table} t "
+        "FROM scores t "
         "INNER JOIN maps b ON t.map_md5 = b.md5 "
-        "WHERE t.userid = :user_id AND t.mode = :mode_vn",
+        "WHERE t.userid = :user_id AND t.mode = :mode",
     ]
 
     params: dict[str, object] = {
         "user_id": player.id,
-        "mode_vn": mode.as_vanilla,
+        "mode": mode,
     }
 
     if mods is not None:
@@ -361,10 +377,13 @@ async def api_get_player_scores(
         if include_loved:
             allowed_statuses.append(5)
 
-        query.append("AND t.status = 2 AND b.status IN :statuses AND t.status != 0")
+        query.append("AND t.status = 2 AND b.status IN :statuses")
         params["statuses"] = allowed_statuses
         sort = "t.pp"
     else:
+        if not include_failed:
+            query.append("AND t.status != 0")
+
         sort = "t.play_time"
 
     query.append(f"ORDER BY {sort} DESC LIMIT :limit")
@@ -405,12 +424,22 @@ async def api_get_player_scores(
 async def api_get_player_most_played(
     user_id: Optional[int] = Query(None, alias="id", ge=3, le=2_147_483_647),
     username: Optional[str] = Query(None, alias="name", regex=regexes.USERNAME.pattern),
-    mode_arg: int = Query(0, alias="mode", ge=0, le=7),
+    mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(25, ge=1, le=100),
     db_conn: databases.core.Connection = Depends(acquire_db_conn),
 ):
     """Return the most played beatmaps of a given player."""
     # NOTE: this will almost certainly not scale well, lol.
+    if mode_arg in (
+        GameMode.RELAX_MANIA,
+        GameMode.AUTOPILOT_CATCH,
+        GameMode.AUTOPILOT_TAIKO,
+        GameMode.AUTOPILOT_MANIA,
+    ):
+        return ORJSONResponse(
+            {"status": "Invalid gamemode."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
     if user_id is not None:
         p = await app.state.sessions.players.from_cache_or_sql(id=user_id)
@@ -436,14 +465,14 @@ async def api_get_player_most_played(
     rows = await db_conn.fetch_all(
         "SELECT m.md5, m.id, m.set_id, m.status, "
         "m.artist, m.title, m.version, m.creator, COUNT(*) plays "
-        f"FROM {mode.scores_table} s "
+        "FROM scores s "
         "INNER JOIN maps m ON m.md5 = s.map_md5 "
         "WHERE s.userid = :user_id "
-        "AND s.mode = :mode_vn "
+        "AND s.mode = :mode "
         "GROUP BY s.map_md5 "
         "ORDER BY plays DESC "
         "LIMIT :limit",
-        {"user_id": p.id, "mode_vn": mode.as_vanilla, "limit": limit},
+        {"user_id": p.id, "mode": mode, "limit": limit},
     )
 
     return ORJSONResponse(
@@ -490,11 +519,22 @@ async def api_get_map_scores(
     map_id: Optional[int] = Query(None, alias="id", ge=0, le=2_147_483_647),
     map_md5: Optional[str] = Query(None, alias="md5", min_length=32, max_length=32),
     mods_arg: Optional[str] = Query(None, alias="mods"),
-    mode_arg: int = Query(0, alias="mode", ge=0, le=7),
+    mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(50, ge=1, le=100),
     db_conn: databases.core.Connection = Depends(acquire_db_conn),
 ):
     """Return the top n scores on a given beatmap."""
+    if mode_arg in (
+        GameMode.RELAX_MANIA,
+        GameMode.AUTOPILOT_CATCH,
+        GameMode.AUTOPILOT_TAIKO,
+        GameMode.AUTOPILOT_MANIA,
+    ):
+        return ORJSONResponse(
+            {"status": "Invalid gamemode."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
     if map_id is not None:
         bmap = await Beatmap.from_bid(map_id)
     elif map_md5 is not None:
@@ -539,17 +579,17 @@ async def api_get_map_scores(
         "s.mode, s.play_time, s.time_elapsed, s.userid, s.perfect, "
         "u.name player_name, "
         "c.id clan_id, c.name clan_name, c.tag clan_tag "
-        f"FROM {mode.scores_table} s "
+        "FROM scores s "
         "INNER JOIN users u ON u.id = s.userid "
         "LEFT JOIN clans c ON c.id = u.clan_id "
         "WHERE s.map_md5 = :map_md5 "
-        "AND s.mode = :mode_vn "
+        "AND s.mode = :mode "
         "AND s.status = 2 "
         "AND u.priv & 1",
     ]
     params: dict[str, object] = {
         "map_md5": bmap.md5,
-        "mode_vn": mode.as_vanilla,
+        "mode": mode,
     }
 
     if mods is not None:
@@ -586,24 +626,11 @@ async def api_get_score_info(
     db_conn: databases.core.Connection = Depends(acquire_db_conn),
 ):
     """Return information about a given score."""
-
-    if SCOREID_BORDERS[0] > score_id >= 1:
-        scores_table = "scores_vn"
-    elif SCOREID_BORDERS[1] > score_id >= SCOREID_BORDERS[0]:
-        scores_table = "scores_rx"
-    elif SCOREID_BORDERS[2] > score_id >= SCOREID_BORDERS[1]:
-        scores_table = "scores_ap"
-    else:
-        return ORJSONResponse(
-            {"status": "Invalid score id."},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
-
     row = await db_conn.fetch_one(
         "SELECT map_md5, score, pp, acc, max_combo, mods, "
         "n300, n100, n50, nmiss, ngeki, nkatu, grade, status, "
         "mode, play_time, time_elapsed, perfect "
-        f"FROM {scores_table} "
+        "FROM scores "
         "WHERE id = :score_id",
         {"score_id": score_id},
     )
@@ -626,18 +653,6 @@ async def api_get_replay(
     db_conn: databases.core.Connection = Depends(acquire_db_conn),
 ):
     """Return a given replay (including headers)."""
-
-    if SCOREID_BORDERS[0] > score_id >= 1:
-        scores_table = "scores_vn"
-    elif SCOREID_BORDERS[1] > score_id >= SCOREID_BORDERS[0]:
-        scores_table = "scores_rx"
-    elif SCOREID_BORDERS[2] > score_id >= SCOREID_BORDERS[1]:
-        scores_table = "scores_ap"
-    else:
-        return ORJSONResponse(
-            {"status": "Invalid score id."},
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
 
     # fetch replay file & make sure it exists
     replay_file = REPLAYS_PATH / f"{score_id}.osr"
@@ -669,7 +684,7 @@ async def api_get_replay(
         "s.mode, s.n300, s.n100, s.n50, s.ngeki, "
         "s.nkatu, s.nmiss, s.score, s.max_combo, "
         "s.perfect, s.mods, s.play_time "
-        f"FROM {scores_table} s "
+        "FROM scores s "
         "INNER JOIN users u ON u.id = s.userid "
         "INNER JOIN maps m ON m.md5 = s.map_md5 "
         "WHERE s.id = :score_id",
@@ -707,9 +722,9 @@ async def api_get_replay(
 
     # pack first section of headers.
     replay_data += struct.pack("<Bi", row["mode"], 20200207)  # TODO: osuver
-    replay_data += packets.write_string(row["map_md5"])
-    replay_data += packets.write_string(row["username"])
-    replay_data += packets.write_string(replay_md5)
+    replay_data += app.packets.write_string(row["map_md5"])
+    replay_data += app.packets.write_string(row["username"])
+    replay_data += app.packets.write_string(replay_md5)
     replay_data += struct.pack(
         "<hhhhhhihBi",
         row["n300"],
@@ -803,12 +818,23 @@ async def api_get_match(
 @router.get("/get_leaderboard")
 async def api_get_global_leaderboard(
     sort: Literal["tscore", "rscore", "pp", "acc"] = "pp",
-    mode_arg: int = Query(0, alias="mode", ge=0, le=7),
+    mode_arg: int = Query(0, alias="mode", ge=0, le=11),
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, min=0, max=2_147_483_647),
     country: Optional[str] = Query(None, min_length=2, max_length=2),
     db_conn: databases.core.Connection = Depends(acquire_db_conn),
 ):
+    if mode_arg in (
+        GameMode.RELAX_MANIA,
+        GameMode.AUTOPILOT_CATCH,
+        GameMode.AUTOPILOT_TAIKO,
+        GameMode.AUTOPILOT_MANIA,
+    ):
+        return ORJSONResponse(
+            {"status": "Invalid gamemode."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
     mode = GameMode(mode_arg)
 
     query_conditions = ["s.mode = :mode", "u.priv & 1", f"s.{sort} > 0"]
@@ -939,7 +965,7 @@ async def api_get_pool(
 
 # @domain.route("/set_avatar", methods=["POST", "PUT"])
 # @requires_api_key
-# async def api_set_avatar(conn: Connection, p: "Player") -> HTTPResponse:
+# async def api_set_avatar(conn: Connection, p: Player) -> HTTPResponse:
 #     """Update the tokenholder's avatar to a given file."""
 #     if "avatar" not in conn.files:
 #         return (400, JSON({"status": "must provide avatar file."}))

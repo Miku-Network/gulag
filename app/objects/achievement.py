@@ -1,4 +1,5 @@
-import functools
+from __future__ import annotations
+
 from typing import Callable
 
 __all__ = ("Achievement",)
@@ -24,6 +25,5 @@ class Achievement:
 
         self.cond = cond
 
-    @functools.cache
     def __repr__(self) -> str:
         return f"{self.file}+{self.name}+{self.desc}"
